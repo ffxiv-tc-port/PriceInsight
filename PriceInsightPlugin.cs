@@ -73,7 +73,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
     }
 
     private void CheckInventories(params InventoryType[] inventoriesToScan) {
-        if (Service.PlayerState.ContentId == 0 || !ItemPriceLookup.CheckReady())
+        if (Service.ClientState.LocalContentId == 0 || !ItemPriceLookup.CheckReady())
             return;
         if (!Configuration.PrefetchInventory)
             return;

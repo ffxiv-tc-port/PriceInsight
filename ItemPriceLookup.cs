@@ -26,11 +26,11 @@ public class ItemPriceLookup : IDisposable {
     }
 
     public bool CheckReady() {
-        if (!Service.PlayerState.IsLoaded) return false;
+        if (Service.ClientState.LocalPlayer is not { } localPlayer) return false;
         if (plugin.Configuration.UseCurrentWorld) {
-            homeWorldId ??= Service.PlayerState.CurrentWorld.RowId;
+            homeWorldId ??= localPlayer.CurrentWorld.RowId;
         } else {
-            homeWorldId ??= Service.PlayerState.HomeWorld.RowId;
+            homeWorldId ??= localPlayer.HomeWorld.RowId;
         }
 
         return homeWorldId != null;
