@@ -10,6 +10,7 @@
 		<Version>$(VersionPrefix).$(BuildNumber)</Version>
 		<AssemblyVersion>$(Version)</AssemblyVersion>
 		<FileVersion>$(Version)</FileVersion>
+		<AppendPlatformToOutputPath>false</AppendPlatformToOutputPath>
 	</PropertyGroup>
 	<Target Name="PersistBuildNumber" AfterTargets="Build">
 		<WriteLinesToFile File="$(BuildNumberFile)" Lines="$(BuildNumber)" Overwrite="true" />
