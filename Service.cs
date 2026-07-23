@@ -9,6 +9,7 @@ namespace PriceInsight;
 internal class Service {
     [PluginService] internal static ICommandManager CommandManager { get; private set; }
     [PluginService] internal static IClientState ClientState { get; private set; }
+    [PluginService] internal static IPlayerState PlayerState { get; private set; }
     [PluginService] internal static IDataManager DataManager { get; private set; }
     [PluginService] internal static IFramework Framework { get; private set; }
     [PluginService] internal static IGameGui GameGui { get; private set; }
