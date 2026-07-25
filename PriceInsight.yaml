@@ -1,5 +1,5 @@
 name: Price Insight
-author: Kouzukii, Lother
+author: Kouzukii
 punchline: 滑鼠懸停即可查看道具的市場公告板價格！
 description: |
   當你將滑鼠移到道具上時，會在下方顯示該道具的普通品/高品質市場公告板價格，以及最近一次的成交紀錄。
