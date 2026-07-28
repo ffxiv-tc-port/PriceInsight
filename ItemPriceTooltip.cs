@@ -78,7 +78,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             priceNode->EdgeColor = baseNode->EdgeColor;
             priceNode->LineSpacing = 18;
             priceNode->FontSize = 12;
-            priceNode->TextFlags = (byte)((TextFlags)baseNode->TextFlags | TextFlags.MultiLine | TextFlags.AutoAdjustNodeSize);
+            priceNode->TextFlags = baseNode->TextFlags | TextFlags.MultiLine | TextFlags.AutoAdjustNodeSize;
             var prev = insertNode->PrevSiblingNode;
             priceNode->AtkResNode.ParentNode = insertNode->ParentNode;
             insertNode->PrevSiblingNode = (AtkResNode*)priceNode;
@@ -322,11 +322,10 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 try {
                     var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
                     unsafe {
-                        var tooltipPtr = (AtkUnitBase*)tooltip;
-                        if (tooltipPtr == null || !tooltipPtr->IsVisible)
+                        if (tooltip.IsNull || !tooltip.IsVisible)
                             return;
-                        RestoreToNormal(tooltipPtr);
-                        UpdateItemTooltip(tooltipPtr, newText);
+                        RestoreToNormal((AtkUnitBase*)tooltip.Address);
+                        UpdateItemTooltip((AtkUnitBase*)tooltip.Address, newText);
                     }
                 } catch (Exception e) {
                     Service.PluginLog.Error(e, "Failed to update tooltip");
@@ -342,11 +341,10 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             try {
                 var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
                 unsafe {
-                    var tooltipPtr = (AtkUnitBase*)tooltip;
-                    if (tooltipPtr == null || !tooltipPtr->IsVisible)
+                    if (tooltip.IsNull || !tooltip.IsVisible)
                         return;
-                    RestoreToNormal(tooltipPtr);
-                    UpdateItemTooltip(tooltipPtr, newText);
+                    RestoreToNormal((AtkUnitBase*)tooltip.Address);
+                    UpdateItemTooltip((AtkUnitBase*)tooltip.Address, newText);
                 }
             } catch (Exception e) {
                 Service.PluginLog.Error(e, "Failed to update tooltip");
@@ -356,7 +354,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
 
     private void Cleanup() {
         unsafe {
-            var atkUnitBase = (AtkUnitBase*)Service.GameGui.GetAddonByName("ItemDetail");
+            var atkUnitBase = (AtkUnitBase*)Service.GameGui.GetAddonByName("ItemDetail").Address;
             if (atkUnitBase == null)
                 return;
 
