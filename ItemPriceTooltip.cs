@@ -18,6 +18,11 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
 
     public int? LastItemQuantity;
 
+    // Alt edge-trigger state: refresh fires once when alt goes down (or when a new item is
+    // hovered with alt already held), never continuously while alt stays held.
+    private bool altWasHeld;
+    private ulong lastEvaluatedItem;
+
     private static readonly CultureInfo FormatProvider = CultureInfo.CurrentCulture.NumberFormat.NumberGroupSeparator == "\u2009"
         ? CultureInfo.InvariantCulture
         : CultureInfo.CurrentCulture;
@@ -40,9 +45,13 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
     }
 
     public unsafe void OnItemTooltip(AtkUnitBase* itemTooltip) {
-        var refresh = plugin.Configuration.RefreshWithAlt && Service.KeyState[VirtualKey.MENU];
-        var (marketBoardData, lookupState) = plugin.ItemPriceLookup.Get(Service.GameGui.HoveredItem, refresh);
-        var payloads = ParseMbData(Service.GameGui.HoveredItem >= 500000, marketBoardData, lookupState);
+        var hoveredItem = Service.GameGui.HoveredItem;
+        var altHeld = plugin.Configuration.RefreshWithAlt && Service.KeyState[VirtualKey.MENU];
+        var refresh = altHeld && (!altWasHeld || lastEvaluatedItem != hoveredItem);
+        altWasHeld = altHeld;
+        lastEvaluatedItem = hoveredItem;
+        var (marketBoardData, lookupState) = plugin.ItemPriceLookup.Get(hoveredItem, refresh);
+        var payloads = ParseMbData(hoveredItem >= 500000, marketBoardData, lookupState);
         UpdateItemTooltip(itemTooltip, payloads);
     }
 
@@ -110,7 +119,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         var payloads = new List<Payload>();
         if (lookupState == LookupState.NonMarketable)
             return payloads;
-        if (lookupState == LookupState.Faulted) {
+        if (lookupState == LookupState.Faulted && mbData == null) {
             payloads.Add(new UIForegroundPayload(20));
             payloads.Add(new IconPayload(BitmapFontIcon.Warning));
             payloads.Add(new TextPayload(" " + "Failed to obtain marketboard info.\n        The Universalis API is likely experiencing issues.\n        Please be patient or check the Universalis discord.\n        Press alt to retry or check the /xllog.".Loc()));
@@ -309,6 +318,22 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 payloads.Add(new TextPayload("No marketboard info is known for this item.\nTry opening the ingame marketboard.".Loc()));
                 payloads.Add(new UIForegroundPayload(0));
             }
+
+            // The old data stays visible (original timestamps included) with a status line below
+            // while a forced refresh runs, or after one just failed.
+            if (lookupState == LookupState.Refreshing) {
+                payloads.Add(new UIForegroundPayload(20));
+                payloads.Add(new TextPayload("\n"));
+                payloads.Add(new IconPayload(BitmapFontIcon.LevelSync));
+                payloads.Add(new TextPayload(" " + "Refreshing..".Loc()));
+                payloads.Add(new UIForegroundPayload(0));
+            } else if (lookupState == LookupState.Faulted) {
+                payloads.Add(new UIForegroundPayload(20));
+                payloads.Add(new TextPayload("\n"));
+                payloads.Add(new IconPayload(BitmapFontIcon.Warning));
+                payloads.Add(new TextPayload(" " + "Refresh failed. Universalis is likely experiencing issues.".Loc()));
+                payloads.Add(new UIForegroundPayload(0));
+            }
         }
 
         return payloads;
@@ -335,8 +360,11 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
     }
 
     public void FetchFailed(ICollection<uint> items) {
-        if (!items.Contains((uint)Service.GameGui.HoveredItem % 500000)) return;
-        var newText = ParseMbData(false, null, LookupState.Faulted);
+        var hoveredItem = Service.GameGui.HoveredItem;
+        if (!items.Contains((uint)hoveredItem % 500000)) return;
+        // Keep showing the retained cache entry (if any) with a failure hint instead of wiping it.
+        var cached = plugin.ItemPriceLookup.GetCached(hoveredItem);
+        var newText = ParseMbData(hoveredItem >= 500000, cached, LookupState.Faulted);
         Service.Framework.RunOnFrameworkThread(() => {
             try {
                 var tooltip = Service.GameGui.GetAddonByName("ItemDetail");

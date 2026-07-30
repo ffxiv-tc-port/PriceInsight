@@ -17,6 +17,12 @@ public class ItemPriceLookup : IDisposable {
     private readonly ConcurrentDictionary<uint, (Task Task, CancellationTokenSource Token)> activeTasks = new();
     // Live data seen on the in-game market board for the tracked world - fresher than anything Universalis has.
     private readonly ConcurrentDictionary<uint, LiveWorldData> liveWorldData = new();
+    // Items whose cached entry is still shown while a forced (alt) refresh is in flight.
+    private readonly ConcurrentDictionary<uint, byte> refreshingItems = new();
+    // When each cached entry was last written (Universalis fetch, live board merge or synthesis).
+    private readonly ConcurrentDictionary<uint, DateTime> lastUpdated = new();
+    // An entry younger than this is not worth re-fetching on a forced refresh.
+    private static readonly TimeSpan FreshnessWindow = TimeSpan.FromSeconds(30);
     private readonly PriceInsightPlugin plugin;
     private readonly CancellationTokenSource cancellationTokenSource = new();
     private uint? homeWorldId;
@@ -53,20 +59,34 @@ public class ItemPriceLookup : IDisposable {
         if (!ToMarketableItemId(fullItemId, out var itemId))
             return (null, LookupState.NonMarketable);
 
-        if (refresh) {
-            cache.Remove(itemId.ToString());
-            if (activeTasks.TryRemove(itemId, out var t))
-                t.Token.Cancel();
-        } else {
-            if (cache.Get<MarketBoardData>(itemId.ToString()) is { IsNull: false, Value: var mbData })
-                return (mbData, LookupState.Marketable);
-            if (activeTasks.TryGetValue(itemId, out var t))
-                return (null, t.Task.IsFaulted ? LookupState.Faulted : LookupState.Marketable);
+        var cached = cache.Get<MarketBoardData>(itemId.ToString()) is { IsNull: false, Value: var mbData } ? mbData : null;
+        if (refresh && cached != null) {
+            // Freshness guard: an entry fetched/merged moments ago has nothing to gain from a re-fetch.
+            if (lastUpdated.TryGetValue(itemId, out var updated) && DateTime.Now - updated < FreshnessWindow)
+                return (cached, LookupState.Marketable);
+            // Keep showing the old entry while the refresh lookup runs; it gets swapped out once
+            // the fetch completes. Don't cancel an in-flight fetch - its result is fresh enough.
+            refreshingItems[itemId] = 0;
+            if (!activeTasks.ContainsKey(itemId) && !requestedItems.Contains(itemId))
+                requestedItems.Enqueue(itemId);
+            return (cached, LookupState.Refreshing);
         }
+
+        if (cached != null)
+            return (cached, refreshingItems.ContainsKey(itemId) ? LookupState.Refreshing : LookupState.Marketable);
+        if (activeTasks.TryGetValue(itemId, out var t))
+            return (null, t.Task.IsFaulted ? LookupState.Faulted : LookupState.Marketable);
 
         requestedItems.Enqueue(itemId);
 
         return (null, LookupState.Marketable);
+    }
+
+    // Cache peek without lookup side effects (no enqueue, no state changes).
+    public MarketBoardData? GetCached(ulong fullItemId) {
+        if (!ToMarketableItemId(fullItemId, out var itemId))
+            return null;
+        return cache.Get<MarketBoardData>(itemId.ToString()) is { IsNull: false, Value: var mbData } ? mbData : null;
     }
 
     private static bool ToMarketableItemId(ulong fullItemId, out uint itemId, ExcelSheet<Item>? sheet = null) {
@@ -169,8 +189,10 @@ public class ItemPriceLookup : IDisposable {
         if (cache.Get<MarketBoardData>(itemId.ToString()) is not { IsNull: false, Value: var mbData })
             return;
         var merged = MergeLiveWorldData(itemId, mbData);
-        if (!ReferenceEquals(merged, mbData))
+        if (!ReferenceEquals(merged, mbData)) {
             cache.Set(itemId.ToString(), merged, TimeSpan.FromMinutes(90));
+            lastUpdated[itemId] = DateTime.Now;
+        }
     }
 
     // Overlay data the player just saw on the market board over the (often much older) Universalis
@@ -234,12 +256,17 @@ public class ItemPriceLookup : IDisposable {
         foreach (var id in itemIds) {
             var task = Task.Run(async () => {
                 var items = await itemTask;
-                if (items != null && items.TryGetValue(id, out var value))
+                if (items != null && items.TryGetValue(id, out var value)) {
                     cache.Set(id.ToString(), value, TimeSpan.FromMinutes(90));
-                else if (SynthesizeFromLiveData(id) is { } fromGameData)
+                    lastUpdated[id] = DateTime.Now;
+                } else if (SynthesizeFromLiveData(id) is { } fromGameData) {
                     // Shorter lifetime so Universalis still gets retried for the cross-world scopes.
                     cache.Set(id.ToString(), fromGameData, TimeSpan.FromMinutes(15));
+                    lastUpdated[id] = DateTime.Now;
+                }
+
                 activeTasks.TryRemove(id, out _);
+                refreshingItems.TryRemove(id, out _);
             }, token.Token);
             task.ContinueWith(_ => { }, TaskContinuationOptions.OnlyOnCanceled);
             activeTasks[id] = (task, token);
