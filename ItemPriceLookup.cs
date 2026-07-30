@@ -22,7 +22,7 @@ public class ItemPriceLookup : IDisposable {
     // When each cached entry was last written (Universalis fetch, live board merge or synthesis).
     private readonly ConcurrentDictionary<uint, DateTime> lastUpdated = new();
     // An entry younger than this is not worth re-fetching on a forced refresh.
-    private static readonly TimeSpan FreshnessWindow = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan FreshnessWindow = TimeSpan.FromMinutes(10);
     private readonly PriceInsightPlugin plugin;
     private readonly CancellationTokenSource cancellationTokenSource = new();
     private uint? homeWorldId;
