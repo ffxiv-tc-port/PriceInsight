@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Command;
+using Dalamud.Game.Network.Structures;
 using Dalamud.Plugin;
 using FFXIVClientStructs.FFXIV.Client.Game;
 
@@ -39,6 +40,24 @@ public class PriceInsightPlugin : IDalamudPlugin {
         pluginInterface.UiBuilder.OpenConfigUi += OpenConfigUI;
         Service.ClientState.Logout += ClearCache;
         Service.ClientState.Login += ClientOnLogin;
+        Service.MarketBoard.OfferingsReceived += MarketBoardOnOfferingsReceived;
+        Service.MarketBoard.HistoryReceived += MarketBoardOnHistoryReceived;
+    }
+
+    private void MarketBoardOnOfferingsReceived(IMarketBoardCurrentOfferings currentOfferings) {
+        try {
+            ItemPriceLookup.ApplyMarketBoardOfferings(currentOfferings);
+        } catch (Exception e) {
+            Service.PluginLog.Error(e, "Failed to apply market board offerings to the price cache");
+        }
+    }
+
+    private void MarketBoardOnHistoryReceived(IMarketBoardHistory history) {
+        try {
+            ItemPriceLookup.ApplyMarketBoardHistory(history);
+        } catch (Exception e) {
+            Service.PluginLog.Error(e, "Failed to apply market board history to the price cache");
+        }
     }
 
     private void ClientOnLogin() {
@@ -113,6 +132,8 @@ public class PriceInsightPlugin : IDalamudPlugin {
         Service.CommandManager.RemoveHandler("/priceinsight");
         Service.ClientState.Logout -= ClearCache;
         Service.ClientState.Login -= ClientOnLogin;
+        Service.MarketBoard.OfferingsReceived -= MarketBoardOnOfferingsReceived;
+        Service.MarketBoard.HistoryReceived -= MarketBoardOnHistoryReceived;
         Hooks.Dispose();
         ItemPriceTooltip.Dispose();
         ItemPriceLookup.Dispose();
