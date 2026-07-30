@@ -115,7 +115,8 @@ public class ItemPriceLookup : IDisposable {
             var result = await plugin.UniversalisClientV2.GetMarketBoardDataList(homeWorldId.Value, itemIds, token.Token);
             if (result != null)
                 plugin.ItemPriceTooltip.Refresh(result);
-            else
+            else if (!token.Token.IsCancellationRequested)
+                // A cancelled lookup (alt-refresh requeues the item, logout/unload tears us down) is not a fetch failure.
                 plugin.ItemPriceTooltip.FetchFailed(itemIds);
             Service.PluginLog.Debug($"Fetching {itemIds.Count} items took {(DateTime.Now - fetchStart).TotalMilliseconds:F0}ms");
             return result;
