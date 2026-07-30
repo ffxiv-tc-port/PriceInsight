@@ -32,32 +32,52 @@ public class UniversalisClientV2 : IDisposable {
     public async Task<Dictionary<uint, MarketBoardData>?> GetMarketBoardDataList(
         uint homeWorldId, ICollection<uint> itemId, CancellationToken cancellationToken) {
         try {
-            using var result =
-                await httpClient.GetAsync($"https://universalis.app/api/v2/aggregated/{homeWorldId}/{string.Join(',', itemId.Select(i => i.ToString()))}",
-                    cancellationToken);
-
-            if (result.StatusCode != HttpStatusCode.OK) {
-                throw new HttpRequestException("Invalid status code " + result.StatusCode, null, result.StatusCode);
+            try {
+                return await GetMarketBoardDataListOnce(homeWorldId, itemId, cancellationToken);
+            } catch (HttpRequestException ex) when (ex.StatusCode is >= HttpStatusCode.InternalServerError) {
+                // Universalis is a public service; intermittent 5xx (esp. 504) is routine. Back off briefly and retry once.
+                Service.PluginLog.Debug("Universalis returned {0} for itemIds {1}, retrying once.", ex.StatusCode, itemId);
+                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
+                return await GetMarketBoardDataListOnce(homeWorldId, itemId, cancellationToken);
             }
-
-            await using var responseStream = await result.Content.ReadAsStreamAsync(cancellationToken);
-            var json = await JsonSerializer.DeserializeAsync<AggregatedMarketBoardData>(responseStream, cancellationToken: cancellationToken);
-            if (json == null) {
-                throw new HttpRequestException("Universalis returned null response");
-            }
-
-            var items = new Dictionary<uint, MarketBoardData>();
-            if (json.results != null) {
-                foreach (var item in json.results) {
-                    items.Add(item.itemId, item.ToMarketBoardData(homeWorldId));
-                }
-            }
-
-            return items;
+        } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+            // Expected cancellation (alt-refresh, logout cache clear, plugin unload) - not an error.
+            Service.PluginLog.Verbose("Universalis lookup for itemIds {0} was cancelled.", itemId);
+            return null;
+        } catch (HttpRequestException ex) when (ex.StatusCode is >= HttpStatusCode.InternalServerError) {
+            // Still 5xx after the retry: server-side issue, not something the user can act on.
+            Service.PluginLog.Warning("Universalis is having issues (HTTP {0}) while fetching itemIds {1}.", ex.StatusCode, itemId);
+            return null;
         } catch (Exception ex) {
             Service.PluginLog.Error(ex, "Failed to retrieve data from Universalis for itemIds {0}.", itemId);
             return null;
         }
+    }
+
+    private async Task<Dictionary<uint, MarketBoardData>?> GetMarketBoardDataListOnce(
+        uint homeWorldId, ICollection<uint> itemId, CancellationToken cancellationToken) {
+        using var result =
+            await httpClient.GetAsync($"https://universalis.app/api/v2/aggregated/{homeWorldId}/{string.Join(',', itemId.Select(i => i.ToString()))}",
+                cancellationToken);
+
+        if (result.StatusCode != HttpStatusCode.OK) {
+            throw new HttpRequestException("Invalid status code " + result.StatusCode, null, result.StatusCode);
+        }
+
+        await using var responseStream = await result.Content.ReadAsStreamAsync(cancellationToken);
+        var json = await JsonSerializer.DeserializeAsync<AggregatedMarketBoardData>(responseStream, cancellationToken: cancellationToken);
+        if (json == null) {
+            throw new HttpRequestException("Universalis returned null response");
+        }
+
+        var items = new Dictionary<uint, MarketBoardData>();
+        if (json.results != null) {
+            foreach (var item in json.results) {
+                items.Add(item.itemId, item.ToMarketBoardData(homeWorldId));
+            }
+        }
+
+        return items;
     }
 
     public void Dispose() {
