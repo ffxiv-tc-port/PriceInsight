@@ -34,8 +34,9 @@ public class UniversalisClientV2 : IDisposable {
         try {
             try {
                 return await GetMarketBoardDataListOnce(homeWorldId, itemId, cancellationToken);
-            } catch (HttpRequestException ex) when (ex.StatusCode is >= HttpStatusCode.InternalServerError) {
-                // Universalis is a public service; intermittent 5xx (esp. 504) is routine. Back off briefly and retry once.
+            } catch (HttpRequestException ex) when (ex.StatusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests or >= HttpStatusCode.InternalServerError) {
+                // Universalis is a public service; intermittent 408/429/5xx (esp. 504, and 429 under
+                // burst load) is routine. Back off briefly and retry once.
                 Service.PluginLog.Debug("Universalis returned {0} for itemIds {1}, retrying once.", ex.StatusCode, itemId);
                 await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken);
                 return await GetMarketBoardDataListOnce(homeWorldId, itemId, cancellationToken);
@@ -44,8 +45,8 @@ public class UniversalisClientV2 : IDisposable {
             // Expected cancellation (alt-refresh, logout cache clear, plugin unload) - not an error.
             Service.PluginLog.Verbose("Universalis lookup for itemIds {0} was cancelled.", itemId);
             return null;
-        } catch (HttpRequestException ex) when (ex.StatusCode is >= HttpStatusCode.InternalServerError) {
-            // Still 5xx after the retry: server-side issue, not something the user can act on.
+        } catch (HttpRequestException ex) when (ex.StatusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests or >= HttpStatusCode.InternalServerError) {
+            // Still transient after the retry: server-side/rate-limit issue, not something the user can act on.
             Service.PluginLog.Warning("Universalis is having issues (HTTP {0}) while fetching itemIds {1}.", ex.StatusCode, itemId);
             return null;
         } catch (Exception ex) {
