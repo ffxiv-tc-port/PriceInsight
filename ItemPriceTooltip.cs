@@ -27,18 +27,57 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         ? CultureInfo.InvariantCulture
         : CultureInfo.CurrentCulture;
 
+    /// <summary>
+    /// Resolves the two sibling nodes that mirror the tooltip window height.
+    /// Returns false when any link in the chain is missing.
+    ///
+    /// itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode 是一條四層裸鏈,
+    /// 原本零檢查。任何一層是 null 都會解參考,而 AtkResNode.SetHeight 是 [MemberFunction]
+    /// 原生呼叫、對 null 呼叫即 AccessViolationException —— 那在 .NET Core 屬於
+    /// corrupted-state exception,try/catch 完全攔不到。
+    /// 失敗時的行為是「不調整高度」,提示視窗版面會不對但不會崩。
+    /// </summary>
+    private static unsafe bool TryGetWindowHeightNodes(AtkUnitBase* itemTooltip, out AtkComponentNode* windowNode,
+        out AtkResNode* rootNode, out AtkResNode* prevSiblingNode) {
+        windowNode = null;
+        rootNode = null;
+        prevSiblingNode = null;
+
+        if (itemTooltip == null)
+            return false;
+
+        windowNode = itemTooltip->WindowNode;
+        if (windowNode == null)
+            return false;
+
+        var component = windowNode->Component;
+        if (component == null)
+            return false;
+
+        rootNode = component->UldManager.RootNode;
+        if (rootNode == null)
+            return false;
+
+        prevSiblingNode = rootNode->PrevSiblingNode;
+        return prevSiblingNode != null;
+    }
+
     public static unsafe void RestoreToNormal(AtkUnitBase* itemTooltip) {
+        if (itemTooltip == null || itemTooltip->UldManager.NodeList == null)
+            return;
         for (var i = 0; i < itemTooltip->UldManager.NodeListCount; i++) {
             var n = itemTooltip->UldManager.NodeList[i];
-            if (n->NodeId != NodeId || !n->IsVisible())
+            if (n == null || n->NodeId != NodeId || !n->IsVisible())
                 continue;
             n->ToggleVisibility(false);
             var insertNode = itemTooltip->GetNodeById(2);
             if (insertNode == null)
                 return;
-            itemTooltip->WindowNode->AtkResNode.SetHeight((ushort)(itemTooltip->WindowNode->AtkResNode.Height - n->Height - 4));
-            itemTooltip->WindowNode->Component->UldManager.RootNode->SetHeight(itemTooltip->WindowNode->AtkResNode.Height);
-            itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode->SetHeight(itemTooltip->WindowNode->AtkResNode.Height);
+            if (!TryGetWindowHeightNodes(itemTooltip, out var windowNode, out var rootNode, out var prevSiblingNode))
+                return;
+            windowNode->AtkResNode.SetHeight((ushort)(windowNode->AtkResNode.Height - n->Height - 4));
+            rootNode->SetHeight(windowNode->AtkResNode.Height);
+            prevSiblingNode->SetHeight(windowNode->AtkResNode.Height);
             insertNode->SetYFloat(insertNode->Y - n->Height - 4);
             break;
         }
@@ -59,6 +98,13 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         if (payloads.Count == 0) {
             return;
         }
+
+        // 先確定整條高度調整鏈都在,再開始改任何東西。
+        // 這樣失敗時是「這次不顯示價格」,而不是改到一半、讓 RestoreToNormal 反向補償出錯位。
+        if (itemTooltip == null || itemTooltip->UldManager.NodeList == null || itemTooltip->RootNode == null)
+            return;
+        if (!TryGetWindowHeightNodes(itemTooltip, out var windowNode, out var windowRootNode, out var windowPrevSiblingNode))
+            return;
 
         AtkTextNode* priceNode = null;
         for (var i = 0; i < itemTooltip->UldManager.NodeListCount; i++) {
@@ -101,12 +147,12 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         priceNode->AtkResNode.ToggleVisibility(true);
         priceNode->SetText(new SeString(payloads).Encode());
         priceNode->ResizeNodeForCurrentText();
-        priceNode->AtkResNode.SetYFloat(itemTooltip->WindowNode->AtkResNode.Height - 8);
-        itemTooltip->WindowNode->SetHeight((ushort)(itemTooltip->WindowNode->AtkResNode.Height + priceNode->AtkResNode.Height + 4));
-        itemTooltip->WindowNode->AtkResNode.SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->WindowNode->Component->UldManager.RootNode->SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode->SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->RootNode->SetHeight(itemTooltip->WindowNode->Height);
+        priceNode->AtkResNode.SetYFloat(windowNode->AtkResNode.Height - 8);
+        windowNode->SetHeight((ushort)(windowNode->AtkResNode.Height + priceNode->AtkResNode.Height + 4));
+        windowNode->AtkResNode.SetHeight(windowNode->Height);
+        windowRootNode->SetHeight(windowNode->Height);
+        windowPrevSiblingNode->SetHeight(windowNode->Height);
+        itemTooltip->RootNode->SetHeight(windowNode->Height);
         var remainingSpace = ImGuiHelpers.MainViewport.WorkSize.Y - itemTooltip->Y - itemTooltip->GetScaledHeight(true) - 36;
         if (remainingSpace < 0) {
             plugin.Hooks.ItemDetailSetPositionPreservingOriginal(itemTooltip, itemTooltip->X, (short)(itemTooltip->Y + remainingSpace), 1);
