@@ -26,7 +26,7 @@ public class Hooks : IDisposable {
     }
 
     private unsafe byte AgentItemDetailOnItemHoveredDetour(void* a1, void* a2, void* a3, void* a4, uint a5, uint a6, int* a7) {
-        var ret = agentItemDetailOnItemHovered.Original(a1, a2, a3, a4, a5, a6, a7);
+        var ret = agentItemDetailOnItemHovered.OriginalDisposeSafe(a1, a2, a3, a4, a5, a6, a7);
         try {
             plugin.ItemPriceTooltip.LastItemQuantity = a7[5];
         } catch (Exception e) {
