@@ -44,7 +44,7 @@ public class ItemPriceLookup : IDisposable {
     }
 
     public bool CheckReady() {
-        var localPlayer = Service.ClientState.LocalPlayer;
+        var localPlayer = Service.ObjectTable.LocalPlayer;
         if (localPlayer == null) return false;
         if (plugin.Configuration.UseCurrentWorld) {
             homeWorldId ??= localPlayer.CurrentWorld.RowId;
