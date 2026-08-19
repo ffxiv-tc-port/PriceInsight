@@ -431,6 +431,10 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             var atkUnitBase = (AtkUnitBase*)Service.GameGui.GetAddonByName("ItemDetail").Address;
             if (atkUnitBase == null)
                 return;
+            // 🔴 NodeListCount 非 0 不保證 NodeList 已配置（同檔另外兩個迴圈都判了，只有這裡漏掉）。
+            // 上界之外還要判指標，否則解參考的是野位址 —— AVE 攔不到。
+            if (atkUnitBase->UldManager.NodeList == null)
+                return;
 
             for (var n = 0; n < atkUnitBase->UldManager.NodeListCount; n++) {
                 var node = atkUnitBase->UldManager.NodeList[n];
