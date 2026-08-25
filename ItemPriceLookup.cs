@@ -23,6 +23,11 @@ public class ItemPriceLookup : IDisposable {
     private readonly ConcurrentDictionary<uint, DateTime> lastUpdated = new();
     // An entry younger than this is not worth re-fetching on a forced refresh.
     private static readonly TimeSpan FreshnessWindow = TimeSpan.FromMinutes(10);
+    // A resolved entry that actually carries prices is cached long; a resolved-but-empty one
+    // (item is marketable but nobody has it listed - common for legacy TC dyes) expires sooner so
+    // the fallback gets another chance without hammering Universalis on every hover.
+    private static readonly TimeSpan SuccessfulCacheDuration = TimeSpan.FromMinutes(90);
+    private static readonly TimeSpan EmptyCacheDuration = TimeSpan.FromMinutes(10);
     private readonly PriceInsightPlugin plugin;
     private readonly CancellationTokenSource cancellationTokenSource = new();
     private uint? homeWorldId;
@@ -257,7 +262,8 @@ public class ItemPriceLookup : IDisposable {
             var task = Task.Run(async () => {
                 var items = await itemTask;
                 if (items != null && items.TryGetValue(id, out var value)) {
-                    cache.Set(id.ToString(), value, TimeSpan.FromMinutes(90));
+                    var duration = value.HasAnyData() ? SuccessfulCacheDuration : EmptyCacheDuration;
+                    cache.Set(id.ToString(), value, duration);
                     lastUpdated[id] = DateTime.Now;
                 } else if (SynthesizeFromLiveData(id) is { } fromGameData) {
                     // Shorter lifetime so Universalis still gets retried for the cross-world scopes.
@@ -287,6 +293,18 @@ public class ItemPriceLookup : IDisposable {
                 }
 
                 plugin.ItemPriceTooltip.Refresh(result);
+
+                // Items the batch could not resolve (and that we cannot synthesize from live board
+                // data) would otherwise leave the tooltip spinning on "being obtained.." forever.
+                // Surface the failure hint so the user can alt-retry; items we do have live data for
+                // are left to the synthesis path above and must not be reported as a failure.
+                if (!token.Token.IsCancellationRequested) {
+                    var unresolvedItems = itemIds
+                        .Where(id => !result.ContainsKey(id) && !liveWorldData.ContainsKey(id))
+                        .ToArray();
+                    if (unresolvedItems.Length > 0)
+                        plugin.ItemPriceTooltip.FetchFailed(unresolvedItems);
+                }
             } else if (!token.Token.IsCancellationRequested)
                 // A cancelled lookup (alt-refresh requeues the item, logout/unload tears us down) is not a fetch failure.
                 plugin.ItemPriceTooltip.FetchFailed(itemIds);

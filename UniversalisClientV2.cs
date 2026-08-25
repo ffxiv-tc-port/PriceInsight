@@ -96,14 +96,26 @@ public class UniversalisClientV2 : IDisposable {
             Service.PluginLog.Debug(
                 "Universalis aggregated data did not resolve itemIds {0}; trying the v3 overview endpoint.",
                 unresolvedItems);
-            foreach (var unresolvedItem in unresolvedItems) {
-                try {
-                    var overviewData = await GetMarketBoardOverview(homeWorldId, unresolvedItem, cancellationToken);
-                    if (overviewData != null)
-                        items[unresolvedItem] = overviewData;
-                } catch (Exception ex) when (!cancellationToken.IsCancellationRequested) {
-                    // One item failing must not sink the rest of the batch; the user can re-hover to retry.
-                    Service.PluginLog.Warning(ex, "Universalis overview fallback failed for itemId {0}.", unresolvedItem);
+            // Keep fallback concurrency deliberately small. An inventory prefetch can contain dozens of
+            // legacy dyes, and each overview request already fans out across every world in the DC, so
+            // run three items at a time rather than sequentially (slow) or all at once (rate-limited).
+            foreach (var batch in unresolvedItems.Chunk(3)) {
+                var fallbackResults = await Task.WhenAll(batch.Select(async unresolvedItem => {
+                    try {
+                        var data = await GetMarketBoardOverview(homeWorldId, unresolvedItem, cancellationToken);
+                        return (ItemId: unresolvedItem, Data: data, Error: (Exception?)null);
+                    } catch (Exception ex) when (!cancellationToken.IsCancellationRequested) {
+                        // One item failing must not sink the rest of the batch; the user can re-hover to retry.
+                        return (ItemId: unresolvedItem, Data: (MarketBoardData?)null, Error: ex);
+                    }
+                }));
+
+                foreach (var fallbackResult in fallbackResults) {
+                    if (fallbackResult.Data != null)
+                        items[fallbackResult.ItemId] = fallbackResult.Data;
+                    else if (fallbackResult.Error != null)
+                        Service.PluginLog.Warning(fallbackResult.Error,
+                            "Universalis overview fallback failed for itemId {0}.", fallbackResult.ItemId);
                 }
             }
         }
@@ -134,14 +146,72 @@ public class UniversalisClientV2 : IDisposable {
         if (worldIds.Length == 0)
             return null;
 
+        // Does the queried data center cover the whole region? On the Traditional Chinese service it
+        // does; elsewhere it does not, and the region scope must then be reported as "no data" rather
+        // than silently equated to the single data center we asked about.
+        var regionWorldIds = WorldLookup
+            .Where(w => w.Value.Region == homeWorld.Region)
+            .Select(w => w.Key)
+            .ToHashSet();
+        var dcCoversRegion = regionWorldIds.SetEquals(worldIds);
+
+        var (statusCode, overview) = await RequestMarketBoardOverview(worldIds, itemId, cancellationToken);
+        if (statusCode == HttpStatusCode.NotFound) {
+            // V3 normally returns 200 with empty arrays for an item nobody has listed. A 404 instead
+            // means one of the supplied world IDs was not recognised. Retry each world on its own so a
+            // single stale/invalid world cannot be mistaken for "this item has no market data at all".
+            Service.PluginLog.Debug(
+                "Universalis rejected the overview world list for itemId {0}; retrying individual worlds.",
+                itemId);
+            var successfulWorldIds = new List<uint>();
+            var partialOverviews = new List<MarketOverview>();
+            foreach (var batch in worldIds.Chunk(3)) {
+                var worldResults = await Task.WhenAll(batch.Select(async worldId => {
+                    var response = await RequestMarketBoardOverview([worldId], itemId, cancellationToken);
+                    return (WorldId: worldId, response.StatusCode, response.Overview);
+                }));
+
+                foreach (var worldResult in worldResults) {
+                    if (worldResult.StatusCode == HttpStatusCode.OK && worldResult.Overview != null) {
+                        successfulWorldIds.Add(worldResult.WorldId);
+                        partialOverviews.Add(worldResult.Overview);
+                    } else if (worldResult.StatusCode == HttpStatusCode.NotFound) {
+                        Service.PluginLog.Warning(
+                            "Universalis does not recognize worldId {0} while retrieving itemId {1}.",
+                            worldResult.WorldId, itemId);
+                    } else {
+                        throw new HttpRequestException(
+                            "Invalid fallback status code " + worldResult.StatusCode, null, worldResult.StatusCode);
+                    }
+                }
+            }
+
+            if (partialOverviews.Count == 0)
+                throw new HttpRequestException("Universalis did not recognize any fallback worlds", null, statusCode);
+
+            var dcComplete = successfulWorldIds.Count == worldIds.Length;
+            return MarketOverview.Merge(itemId, partialOverviews)
+                .ToMarketBoardData(homeWorldId, successfulWorldIds, dcComplete, dcComplete && dcCoversRegion);
+        }
+
+        if (statusCode != HttpStatusCode.OK)
+            throw new HttpRequestException("Invalid fallback status code " + statusCode, null, statusCode);
+
+        return overview?.ToMarketBoardData(homeWorldId, worldIds, true, dcCoversRegion);
+    }
+
+    private async Task<(HttpStatusCode StatusCode, MarketOverview? Overview)> RequestMarketBoardOverview(
+        IReadOnlyCollection<uint> worldIds, uint itemId, CancellationToken cancellationToken) {
         var requestUri = $"https://universalis.app/api/v3/market/overview/{string.Join(',', worldIds)}/{itemId}";
         using var result = await GetOverviewWithRetry(requestUri, cancellationToken);
+        // Unlike the aggregated path this deliberately does not throw on a non-OK status: the caller
+        // grades 404 (unknown world) separately from other failures.
         if (result.StatusCode != HttpStatusCode.OK)
-            throw new HttpRequestException("Invalid fallback status code " + result.StatusCode, null, result.StatusCode);
+            return (result.StatusCode, null);
 
         await using var responseStream = await result.Content.ReadAsStreamAsync(cancellationToken);
         var overview = await JsonSerializer.DeserializeAsync<MarketOverview>(responseStream, cancellationToken: cancellationToken);
-        return overview?.ToMarketBoardData(homeWorldId, worldIds);
+        return (result.StatusCode, overview);
     }
 
     /// <remarks>
@@ -194,45 +264,65 @@ file class AggregatedMarketBoardData {
     public List<uint>? failedItems { get; set; }
 }
 
-file class MarketOverview {
+internal class MarketOverview {
     public uint item { get; set; }
     public Dictionary<uint, long?>? updatedAt { get; set; }
     public List<OverviewListing>? listings { get; set; }
     public List<OverviewSale>? sales { get; set; }
 
-    public MarketBoardData ToMarketBoardData(uint homeWorldId, IReadOnlyCollection<uint> dcWorldIds) {
+    /// <summary>
+    /// Combines the per-world overviews collected during the 404 fallback into one so the aggregate
+    /// (min price, recent sale, average, velocity) is computed over every world that answered.
+    /// </summary>
+    public static MarketOverview Merge(uint itemId, IEnumerable<MarketOverview> overviews) {
+        var overviewList = overviews.ToList();
+        return new MarketOverview {
+            item = itemId,
+            updatedAt = overviewList
+                .SelectMany(o => o.updatedAt ?? [])
+                .GroupBy(entry => entry.Key)
+                .ToDictionary(group => group.Key, group => group.Last().Value),
+            listings = overviewList.SelectMany(o => o.listings ?? []).ToList(),
+            sales = overviewList.SelectMany(o => o.sales ?? []).ToList(),
+        };
+    }
+
+    public MarketBoardData ToMarketBoardData(
+        uint homeWorldId, IReadOnlyCollection<uint> dcWorldIds, bool dcComplete, bool regionComplete) {
         var (homeWorld, dcName, region) = UniversalisClientV2.WorldLookup[homeWorldId];
         var homeWorldIds = new HashSet<uint> { homeWorldId };
         var dcWorldIdSet = dcWorldIds.ToHashSet();
 
+        // When the DC (or region) query only partially resolved, report that scope as "no data"
+        // rather than a minimum drawn from an incomplete world set that would mislead the user.
         return new MarketBoardData {
             HomeWorld = homeWorld,
             Datacenter = dcName,
             Region = region,
             MinimumPrice = new() {
                 World = GetMinimumPrice(homeWorldIds),
-                Datacenter = GetMinimumPrice(dcWorldIdSet),
-                // The fallback intentionally queries one data center. The Traditional Chinese
-                // region currently contains that single data center, so both scopes are equal.
-                Region = GetMinimumPrice(dcWorldIdSet),
+                Datacenter = dcComplete ? GetMinimumPrice(dcWorldIdSet) : NoData<PriceInsight.Listing>(),
+                Region = regionComplete ? GetMinimumPrice(dcWorldIdSet) : NoData<PriceInsight.Listing>(),
             },
             MostRecentPurchase = new() {
                 World = GetMostRecentPurchase(homeWorldIds),
-                Datacenter = GetMostRecentPurchase(dcWorldIdSet),
-                Region = GetMostRecentPurchase(dcWorldIdSet),
+                Datacenter = dcComplete ? GetMostRecentPurchase(dcWorldIdSet) : NoData<PriceInsight.Listing>(),
+                Region = regionComplete ? GetMostRecentPurchase(dcWorldIdSet) : NoData<PriceInsight.Listing>(),
             },
             AverageSalePrice = new() {
                 World = GetAverageSalePrice(homeWorldIds),
-                Datacenter = GetAverageSalePrice(dcWorldIdSet),
-                Region = GetAverageSalePrice(dcWorldIdSet),
+                Datacenter = dcComplete ? GetAverageSalePrice(dcWorldIdSet) : NoData<double?>(),
+                Region = regionComplete ? GetAverageSalePrice(dcWorldIdSet) : NoData<double?>(),
             },
             DailySaleVelocity = new() {
                 World = GetDailySaleVelocity(homeWorldIds),
-                Datacenter = GetDailySaleVelocity(dcWorldIdSet),
-                Region = GetDailySaleVelocity(dcWorldIdSet),
+                Datacenter = dcComplete ? GetDailySaleVelocity(dcWorldIdSet) : NoData<double?>(),
+                Region = regionComplete ? GetDailySaleVelocity(dcWorldIdSet) : NoData<double?>(),
             },
         };
     }
+
+    private static Quality<T> NoData<T>() => new() { Nq = default, Hq = default };
 
     private Quality<PriceInsight.Listing> GetMinimumPrice(IReadOnlySet<uint> worldIds) => new() {
         Nq = GetMinimumPrice(worldIds, false),
@@ -264,9 +354,12 @@ file class MarketOverview {
     };
 
     private double? GetAverageSalePrice(IReadOnlySet<uint> worldIds, bool hq) {
-        var recentSales = GetRecentSales(worldIds, hq).ToList();
-        var quantity = recentSales.Sum(s => (long)s.quantity);
-        return quantity > 0 ? recentSales.Sum(s => (double)s.price * s.quantity) / quantity : null;
+        if (IsRecentSalesTruncated(worldIds))
+            return null;
+
+        var recentSales = GetRecentSales(worldIds, hq).Where(s => s.quantity is > 0).ToList();
+        var quantity = recentSales.Sum(s => (long)s.quantity!.Value);
+        return quantity > 0 ? recentSales.Sum(s => (double)s.price * s.quantity!.Value) / quantity : null;
     }
 
     private Quality<double?> GetDailySaleVelocity(IReadOnlySet<uint> worldIds) => new() {
@@ -275,15 +368,34 @@ file class MarketOverview {
     };
 
     private double? GetDailySaleVelocity(IReadOnlySet<uint> worldIds, bool hq) {
-        var quantity = GetRecentSales(worldIds, hq).Sum(s => (long)s.quantity);
+        if (IsRecentSalesTruncated(worldIds))
+            return null;
+
+        var quantity = GetRecentSales(worldIds, hq)
+            .Where(s => s.quantity is > 0)
+            .Sum(s => (long)s.quantity!.Value);
         return quantity > 0 ? quantity / 4d : null;
     }
 
     private IEnumerable<OverviewSale> GetRecentSales(IReadOnlySet<uint> worldIds, bool hq) {
-        var startOfWindow = new DateTimeOffset(DateTime.UtcNow.Date.AddDays(-3), TimeSpan.Zero).ToUnixTimeMilliseconds();
+        var startOfWindow = GetSaleWindowStart();
         return sales?.Where(s => worldIds.Contains(s.world) && s.hq == hq && s.saleTime >= startOfWindow)
                ?? Enumerable.Empty<OverviewSale>();
     }
+
+    // V3 overview caps the sales list at 20 entries per world. If a world already fills that cap
+    // entirely from within the 3-day averaging window, older sales in the window were dropped and any
+    // average/velocity computed from it would be understated - report nothing rather than a wrong number.
+    private bool IsRecentSalesTruncated(IReadOnlySet<uint> worldIds) {
+        var startOfWindow = GetSaleWindowStart();
+        return worldIds.Any(worldId => {
+            var worldSales = sales?.Where(s => s.world == worldId).ToList() ?? [];
+            return worldSales.Count >= 20 && worldSales.Min(s => s.saleTime) >= startOfWindow;
+        });
+    }
+
+    private static long GetSaleWindowStart() =>
+        new DateTimeOffset(DateTime.UtcNow.Date.AddDays(-3), TimeSpan.Zero).ToUnixTimeMilliseconds();
 
     private static PriceInsight.Listing ToListing(long price, uint worldId, long timestamp) {
         UniversalisClientV2.WorldLookup.TryGetValue(worldId, out var world);
@@ -296,7 +408,7 @@ file class MarketOverview {
     }
 }
 
-file class OverviewListing {
+internal class OverviewListing {
     public uint world { get; set; }
     public long reviewedAt { get; set; }
     public decimal price { get; set; }
@@ -311,11 +423,12 @@ file class OverviewListing {
         : (long)Math.Floor(price / 1.05m);
 }
 
-file class OverviewSale {
+internal class OverviewSale {
     public uint world { get; set; }
     public bool hq { get; set; }
     public long price { get; set; }
-    public int quantity { get; set; }
+    // Nullable: a malformed/absent quantity must not be silently read as 0 and skew the average.
+    public int? quantity { get; set; }
     public long saleTime { get; set; }
 }
 
