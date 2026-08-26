@@ -78,7 +78,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             priceNode->EdgeColor = baseNode->EdgeColor;
             priceNode->LineSpacing = 18;
             priceNode->FontSize = 12;
-            priceNode->TextFlags = baseNode->TextFlags | TextFlags.MultiLine | TextFlags.AutoAdjustNodeSize;
+            priceNode->TextFlags = (byte)((TextFlags)baseNode->TextFlags | TextFlags.MultiLine | TextFlags.AutoAdjustNodeSize);
             var prev = insertNode->PrevSiblingNode;
             priceNode->AtkResNode.ParentNode = insertNode->ParentNode;
             insertNode->PrevSiblingNode = (AtkResNode*)priceNode;
@@ -113,12 +113,12 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         if (lookupState == LookupState.Faulted) {
             payloads.Add(new UIForegroundPayload(20));
             payloads.Add(new IconPayload(BitmapFontIcon.Warning));
-            payloads.Add(new TextPayload(" Failed to obtain marketboard info.\n        The Universalis API is likely experiencing issues.\n        Please be patient or check the Universalis discord.\n        Press alt to retry or check the /xllog."));
+            payloads.Add(new TextPayload(" " + "Failed to obtain marketboard info.\n        The Universalis API is likely experiencing issues.\n        Please be patient or check the Universalis discord.\n        Press alt to retry or check the /xllog.".Loc()));
             payloads.Add(new UIForegroundPayload(0));
         } else if (mbData == null) {
             payloads.Add(new UIForegroundPayload(20));
             payloads.Add(new IconPayload(BitmapFontIcon.LevelSync));
-            payloads.Add(new TextPayload(" Marketboard info is being obtained.."));
+            payloads.Add(new TextPayload(" " + "Marketboard info is being obtained..".Loc()));
             payloads.Add(new UIForegroundPayload(0));
         } else {
             var ownWorld = mbData.HomeWorld;
@@ -129,7 +129,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             var priceHeader = false;
             void PriceHeader() {
                 if (priceHeader) return;
-                payloads.Add(new TextPayload("Marketboard Price:"));
+                payloads.Add(new TextPayload("Marketboard Price:".Loc()));
                 priceHeader = true;
             }
 
@@ -179,7 +179,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                     ? mbData.MinimumPrice.Region.Hq?.World ?? mbData.MinimumPrice.Region.Nq?.World
                     : mbData.MinimumPrice.Region.Nq?.World ?? mbData.MinimumPrice.Region.Hq?.World;
 
-                payloads.Add(new TextPayload("\n  Cheapest ("));
+                payloads.Add(new TextPayload("\n  Cheapest (".Loc()));
                 payloads.Add(new IconPayload(BitmapFontIcon.CrossWorld));
                 payloads.Add(new TextPayload($"{minWorldRegion}"));
                 if (plugin.Configuration.ShowDatacenterOnCrossWorlds)
@@ -196,7 +196,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (minWorld != ownWorld && minWorld != null && (plugin.Configuration.ShowDatacenter || (plugin.Configuration.ShowRegion && minDc == ownDc))) {
                 PriceHeader();
 
-                payloads.Add(new TextPayload("\n  Cheapest ("));
+                payloads.Add(new TextPayload("\n  Cheapest (".Loc()));
                 payloads.Add(new IconPayload(BitmapFontIcon.CrossWorld));
                 payloads.Add(new TextPayload($"{minWorld}): "));
                 PrintNqHq(mbData.MinimumPrice.Datacenter.Nq?.Price, mbData.MinimumPrice.Datacenter.Hq?.Price);
@@ -210,7 +210,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (GetNqHqData(mbData.MinimumPrice.World.Nq,  mbData.MinimumPrice.World.Hq) != null && (plugin.Configuration.ShowWorld || (plugin.Configuration.ShowDatacenter && minWorld == ownWorld))) {
                 PriceHeader();
 
-                payloads.Add(new TextPayload($"\n  Home ({ownWorld}): "));
+                payloads.Add(new TextPayload("\n  Home (??)".Loc(ownWorld) + ": "));
                 PrintNqHq(mbData.MinimumPrice.World.Nq?.Price, mbData.MinimumPrice.World.Hq?.Price);
 
                 if (plugin.Configuration.ShowAge) {
@@ -224,7 +224,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 if (recentHeader) return;
                 if (payloads.Count > 0)
                     payloads.Add(new TextPayload("\n"));
-                payloads.Add(new TextPayload("Most Recent Purchase:"));
+                payloads.Add(new TextPayload("Most Recent Purchase:".Loc()));
                 recentHeader = true;
             }
 
@@ -237,7 +237,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                     ? mbData.MostRecentPurchase.Region.Hq?.World ?? mbData.MostRecentPurchase.Region.Nq?.World
                     : mbData.MostRecentPurchase.Region.Nq?.World ?? mbData.MostRecentPurchase.Region.Hq?.World;
 
-                payloads.Add(new TextPayload("\n  Region ("));
+                payloads.Add(new TextPayload("\n  Region (".Loc()));
                 payloads.Add(new IconPayload(BitmapFontIcon.CrossWorld));
                 payloads.Add(new TextPayload($"{recentWorldRegion} {recentDc}): "));
                 PrintNqHq(mbData.MostRecentPurchase.Region.Nq?.Price, mbData.MostRecentPurchase.Region.Hq?.Price);
@@ -251,7 +251,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (recentWorld != ownWorld && recentWorld != null && (plugin.Configuration.ShowMostRecentPurchase || (plugin.Configuration.ShowMostRecentPurchaseRegion && recentDc == ownDc))) {
                 RecentHeader();
 
-                payloads.Add(new TextPayload("\n  Datacenter ("));
+                payloads.Add(new TextPayload("\n  Datacenter (".Loc()));
                 payloads.Add(new IconPayload(BitmapFontIcon.CrossWorld));
                 payloads.Add(new TextPayload($"{recentWorld}): "));
                 PrintNqHq(mbData.MostRecentPurchase.Datacenter.Nq?.Price, mbData.MostRecentPurchase.Datacenter.Hq?.Price);
@@ -265,7 +265,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (GetNqHqData(mbData.MostRecentPurchase.World.Nq, mbData.MostRecentPurchase.World.Hq) != null && (plugin.Configuration.ShowMostRecentPurchaseWorld || (plugin.Configuration.ShowMostRecentPurchase && recentWorld == ownWorld))) {
                 RecentHeader();
 
-                payloads.Add(new TextPayload($"\n  Home ({ownWorld}): "));
+                payloads.Add(new TextPayload("\n  Home (??)".Loc(ownWorld) + ": "));
                 PrintNqHq(mbData.MostRecentPurchase.World.Nq?.Price, mbData.MostRecentPurchase.World.Hq?.Price);
 
                 if (plugin.Configuration.ShowAge) {
@@ -284,7 +284,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 if (salePrice != null && GetNqHqData(salePrice.Nq, salePrice.Hq) != null) {
                     if (payloads.Count > 0)
                         payloads.Add(new TextPayload("\n"));
-                    payloads.Add(new TextPayload($"Average sale price ({scope}): "));
+                    payloads.Add(new TextPayload("Average sale price (??)".Loc(scope) + ": "));
                     PrintNqHq(salePrice.Nq, salePrice.Hq);
                 }
             }
@@ -299,14 +299,14 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 if (saleVelocity != null && GetNqHqData(saleVelocity.Nq, saleVelocity.Hq) != null) {
                     if (payloads.Count > 0)
                         payloads.Add(new TextPayload("\n"));
-                    payloads.Add(new TextPayload($"Sales per day ({scope}): "));
+                    payloads.Add(new TextPayload("Sales per day (??)".Loc(scope) + ": "));
                     PrintNqHq(saleVelocity.Nq, saleVelocity.Hq, format: "N1", withGilIcon: false);
                 }
             }
 
             if (payloads.Count == 0) {
                 payloads.Add(new UIForegroundPayload(20));
-                payloads.Add(new TextPayload("No marketboard info is known for this item.\nTry opening the ingame marketboard."));
+                payloads.Add(new TextPayload("No marketboard info is known for this item.\nTry opening the ingame marketboard.".Loc()));
                 payloads.Add(new UIForegroundPayload(0));
             }
         }
@@ -322,10 +322,11 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 try {
                     var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
                     unsafe {
-                        if (tooltip.IsNull || !tooltip.IsVisible)
+                        var tooltipPtr = (AtkUnitBase*)tooltip;
+                        if (tooltipPtr == null || !tooltipPtr->IsVisible)
                             return;
-                        RestoreToNormal((AtkUnitBase*)tooltip.Address);
-                        UpdateItemTooltip((AtkUnitBase*)tooltip.Address, newText);
+                        RestoreToNormal(tooltipPtr);
+                        UpdateItemTooltip(tooltipPtr, newText);
                     }
                 } catch (Exception e) {
                     Service.PluginLog.Error(e, "Failed to update tooltip");
@@ -341,10 +342,11 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             try {
                 var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
                 unsafe {
-                    if (tooltip.IsNull || !tooltip.IsVisible)
+                    var tooltipPtr = (AtkUnitBase*)tooltip;
+                    if (tooltipPtr == null || !tooltipPtr->IsVisible)
                         return;
-                    RestoreToNormal((AtkUnitBase*)tooltip.Address);
-                    UpdateItemTooltip((AtkUnitBase*)tooltip.Address, newText);
+                    RestoreToNormal(tooltipPtr);
+                    UpdateItemTooltip(tooltipPtr, newText);
                 }
             } catch (Exception e) {
                 Service.PluginLog.Error(e, "Failed to update tooltip");
@@ -354,7 +356,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
 
     private void Cleanup() {
         unsafe {
-            var atkUnitBase = (AtkUnitBase*)Service.GameGui.GetAddonByName("ItemDetail").Address;
+            var atkUnitBase = (AtkUnitBase*)Service.GameGui.GetAddonByName("ItemDetail");
             if (atkUnitBase == null)
                 return;
 
@@ -379,12 +381,12 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
 
     private static string PrintDuration(TimeSpan span) {
         if (span.Days > 0)
-            return $"{span.Days}d ago";
+            return "??d ago".Loc(span.Days);
         if (span.Hours > 0)
-            return $"{span.Hours}h ago";
+            return "??h ago".Loc(span.Hours);
         if (span.Minutes > 0)
-            return $"{span.Minutes}m ago";
-        return "just now";
+            return "??m ago".Loc(span.Minutes);
+        return "just now".Loc();
     }
 
     public void Dispose() {

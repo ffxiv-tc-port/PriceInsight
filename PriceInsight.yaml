@@ -1,11 +1,11 @@
 name: Price Insight
 author: Kouzukii
-punchline: See item marketboard prices on hover!
+punchline: 滑鼠懸停即可查看道具的市場公告板價格！
 description: |
-  Whenever you mouseover an item, it will show you the NQ/HQ marketboard prices at the bottom as well as the most recent purchase.
-  Prices are retrieved from Universalis.app and cached for 90 minutes.
-  To refresh a price you can tap Alt while hovering over an item.
-repo_url: "https://github.com/kouzukii/ffxiv-priceinsight"
+  當你將滑鼠移到道具上時，會在下方顯示該道具的普通品/高品質市場公告板價格，以及最近一次的成交紀錄。
+  價格資料來自 Universalis.app，並會快取 90 分鐘。
+  若要重新整理價格，可在滑鼠懸停於道具上時按住 Alt 鍵。
+repo_url: "https://github.com/ffxiv-tc-port/PriceInsight"
 tags: [marketboard, items, price]
 category_tags: [ui, utility]
 icon_url: https://raw.githubusercontent.com/Kouzukii/ffxiv-priceinsight/master/PriceInsight/images/icon.png

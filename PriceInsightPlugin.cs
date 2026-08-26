@@ -19,6 +19,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
 
     public PriceInsightPlugin(IDalamudPluginInterface pluginInterface) {
         Service.Initialize(pluginInterface);
+        Localization.Init(pluginInterface.AssemblyLocation.DirectoryName);
 
         Configuration = Configuration.Get(pluginInterface);
 
@@ -28,7 +29,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
         Hooks = new Hooks(this);
         configUi = new ConfigUI(this);
 
-        Service.CommandManager.AddHandler("/priceinsight", new CommandInfo((_, _) => OpenConfigUI()) { HelpMessage = "Price Insight Configuration Menu" });
+        Service.CommandManager.AddHandler("/priceinsight", new CommandInfo((_, _) => OpenConfigUI()) { HelpMessage = "Price Insight Configuration Menu".Loc() });
 
         Service.AddonLifecycle.RegisterListener(AddonEvent.PostRequestedUpdate, ["Inventory", "InventoryLarge", "InventoryExpansion"], HandleInventoryUpdate);
         Service.AddonLifecycle.RegisterListener(AddonEvent.PreSetup, "InventoryBuddy", HandleSaddlebagOpen);
@@ -73,7 +74,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
     }
 
     private void CheckInventories(params InventoryType[] inventoriesToScan) {
-        if (Service.PlayerState.ContentId == 0 || !ItemPriceLookup.CheckReady())
+        if (Service.ClientState.LocalContentId == 0 || !ItemPriceLookup.CheckReady())
             return;
         if (!Configuration.PrefetchInventory)
             return;
