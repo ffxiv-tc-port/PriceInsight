@@ -1,5 +1,5 @@
 using System;
-using ImGuiNET;
+using Dalamud.Bindings.ImGui;
 
 namespace PriceInsight;
 
@@ -98,7 +98,7 @@ internal class ConfigUI(PriceInsightPlugin plugin) : IDisposable {
             ImGui.Separator();
 
             var selectValue = conf.ShowDailySaleVelocityIn;
-            if (ImGui.Combo("Show sales per day".Loc(), ref selectValue, new[] {"Do not show".Loc(), "World".Loc(), "Datacenter".Loc(), "Region".Loc()}, 4)) {
+            if (ImGui.Combo("Show sales per day".Loc(), ref selectValue, ["Do not show".Loc(), "World".Loc(), "Datacenter".Loc(), "Region".Loc()])) {
                 conf.ShowDailySaleVelocityIn = selectValue;
                 conf.Save();
             }
@@ -106,7 +106,7 @@ internal class ConfigUI(PriceInsightPlugin plugin) : IDisposable {
                 ImGui.SetTooltip("Show the average sales per day based on sales of the last 4 days.".Loc());
 
             selectValue = conf.ShowAverageSalePriceIn;
-            if (ImGui.Combo("Show average sale price".Loc(), ref selectValue, new[] {"Do not show".Loc(), "World".Loc(), "Datacenter".Loc(), "Region".Loc()}, 4)) {
+            if (ImGui.Combo("Show average sale price".Loc(), ref selectValue, ["Do not show".Loc(), "World".Loc(), "Datacenter".Loc(), "Region".Loc()])) {
                 conf.ShowAverageSalePriceIn = selectValue;
                 conf.Save();
             }

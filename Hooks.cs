@@ -21,8 +21,8 @@ public class Hooks : IDisposable {
         this.plugin = plugin;
         Service.GameInteropProvider.InitializeFromAttributes(this);
         agentItemDetailOnItemHovered.Enable();
-        Service.AddonLifecycle.RegisterListener(AddonEvent.PreRequestedUpdate, "ItemDetail", (_, args) => ItemPriceTooltip.RestoreToNormal((AtkUnitBase*)args.Addon));
-        Service.AddonLifecycle.RegisterListener(AddonEvent.PostRequestedUpdate, "ItemDetail", (_, args) => plugin.ItemPriceTooltip.OnItemTooltip((AtkUnitBase*)args.Addon));
+        Service.AddonLifecycle.RegisterListener(AddonEvent.PreRequestedUpdate, "ItemDetail", (_, args) => ItemPriceTooltip.RestoreToNormal((AtkUnitBase*)args.Addon.Address));
+        Service.AddonLifecycle.RegisterListener(AddonEvent.PostRequestedUpdate, "ItemDetail", (_, args) => plugin.ItemPriceTooltip.OnItemTooltip((AtkUnitBase*)args.Addon.Address));
     }
 
     private unsafe byte AgentItemDetailOnItemHoveredDetour(void* a1, void* a2, void* a3, void* a4, uint a5, uint a6, int* a7) {
