@@ -18,31 +18,79 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
 
     public int? LastItemQuantity;
 
+    // Alt edge-trigger state: refresh fires once when alt goes down (or when a new item is
+    // hovered with alt already held), never continuously while alt stays held.
+    private bool altWasHeld;
+    private ulong lastEvaluatedItem;
+
     private static readonly CultureInfo FormatProvider = CultureInfo.CurrentCulture.NumberFormat.NumberGroupSeparator == "\u2009"
         ? CultureInfo.InvariantCulture
         : CultureInfo.CurrentCulture;
 
+    /// <summary>
+    /// Resolves the two sibling nodes that mirror the tooltip window height.
+    /// Returns false when any link in the chain is missing.
+    ///
+    /// itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode 是一條四層裸鏈,
+    /// 原本零檢查。任何一層是 null 都會解參考,而 AtkResNode.SetHeight 是 [MemberFunction]
+    /// 原生呼叫、對 null 呼叫即 AccessViolationException —— 那在 .NET Core 屬於
+    /// corrupted-state exception,try/catch 完全攔不到。
+    /// 失敗時的行為是「不調整高度」,提示視窗版面會不對但不會崩。
+    /// </summary>
+    private static unsafe bool TryGetWindowHeightNodes(AtkUnitBase* itemTooltip, out AtkComponentNode* windowNode,
+        out AtkResNode* rootNode, out AtkResNode* prevSiblingNode) {
+        windowNode = null;
+        rootNode = null;
+        prevSiblingNode = null;
+
+        if (itemTooltip == null)
+            return false;
+
+        windowNode = itemTooltip->WindowNode;
+        if (windowNode == null)
+            return false;
+
+        var component = windowNode->Component;
+        if (component == null)
+            return false;
+
+        rootNode = component->UldManager.RootNode;
+        if (rootNode == null)
+            return false;
+
+        prevSiblingNode = rootNode->PrevSiblingNode;
+        return prevSiblingNode != null;
+    }
+
     public static unsafe void RestoreToNormal(AtkUnitBase* itemTooltip) {
+        if (itemTooltip == null || itemTooltip->UldManager.NodeList == null)
+            return;
         for (var i = 0; i < itemTooltip->UldManager.NodeListCount; i++) {
             var n = itemTooltip->UldManager.NodeList[i];
-            if (n->NodeId != NodeId || !n->IsVisible())
+            if (n == null || n->NodeId != NodeId || !n->IsVisible())
                 continue;
             n->ToggleVisibility(false);
             var insertNode = itemTooltip->GetNodeById(2);
             if (insertNode == null)
                 return;
-            itemTooltip->WindowNode->AtkResNode.SetHeight((ushort)(itemTooltip->WindowNode->AtkResNode.Height - n->Height - 4));
-            itemTooltip->WindowNode->Component->UldManager.RootNode->SetHeight(itemTooltip->WindowNode->AtkResNode.Height);
-            itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode->SetHeight(itemTooltip->WindowNode->AtkResNode.Height);
+            if (!TryGetWindowHeightNodes(itemTooltip, out var windowNode, out var rootNode, out var prevSiblingNode))
+                return;
+            windowNode->AtkResNode.SetHeight((ushort)(windowNode->AtkResNode.Height - n->Height - 4));
+            rootNode->SetHeight(windowNode->AtkResNode.Height);
+            prevSiblingNode->SetHeight(windowNode->AtkResNode.Height);
             insertNode->SetYFloat(insertNode->Y - n->Height - 4);
             break;
         }
     }
 
     public unsafe void OnItemTooltip(AtkUnitBase* itemTooltip) {
-        var refresh = plugin.Configuration.RefreshWithAlt && Service.KeyState[VirtualKey.MENU];
-        var (marketBoardData, lookupState) = plugin.ItemPriceLookup.Get(Service.GameGui.HoveredItem, refresh);
-        var payloads = ParseMbData(Service.GameGui.HoveredItem >= 500000, marketBoardData, lookupState);
+        var hoveredItem = Service.GameGui.HoveredItem;
+        var altHeld = plugin.Configuration.RefreshWithAlt && Service.KeyState[VirtualKey.MENU];
+        var refresh = altHeld && (!altWasHeld || lastEvaluatedItem != hoveredItem);
+        altWasHeld = altHeld;
+        lastEvaluatedItem = hoveredItem;
+        var (marketBoardData, lookupState) = plugin.ItemPriceLookup.Get(hoveredItem, refresh);
+        var payloads = ParseMbData(hoveredItem >= 500000, marketBoardData, lookupState);
         UpdateItemTooltip(itemTooltip, payloads);
     }
 
@@ -50,6 +98,13 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         if (payloads.Count == 0) {
             return;
         }
+
+        // 先確定整條高度調整鏈都在,再開始改任何東西。
+        // 這樣失敗時是「這次不顯示價格」,而不是改到一半、讓 RestoreToNormal 反向補償出錯位。
+        if (itemTooltip == null || itemTooltip->UldManager.NodeList == null || itemTooltip->RootNode == null)
+            return;
+        if (!TryGetWindowHeightNodes(itemTooltip, out var windowNode, out var windowRootNode, out var windowPrevSiblingNode))
+            return;
 
         AtkTextNode* priceNode = null;
         for (var i = 0; i < itemTooltip->UldManager.NodeListCount; i++) {
@@ -92,12 +147,12 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         priceNode->AtkResNode.ToggleVisibility(true);
         priceNode->SetText(new SeString(payloads).Encode());
         priceNode->ResizeNodeForCurrentText();
-        priceNode->AtkResNode.SetYFloat(itemTooltip->WindowNode->AtkResNode.Height - 8);
-        itemTooltip->WindowNode->SetHeight((ushort)(itemTooltip->WindowNode->AtkResNode.Height + priceNode->AtkResNode.Height + 4));
-        itemTooltip->WindowNode->AtkResNode.SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->WindowNode->Component->UldManager.RootNode->SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode->SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->RootNode->SetHeight(itemTooltip->WindowNode->Height);
+        priceNode->AtkResNode.SetYFloat(windowNode->AtkResNode.Height - 8);
+        windowNode->SetHeight((ushort)(windowNode->AtkResNode.Height + priceNode->AtkResNode.Height + 4));
+        windowNode->AtkResNode.SetHeight(windowNode->Height);
+        windowRootNode->SetHeight(windowNode->Height);
+        windowPrevSiblingNode->SetHeight(windowNode->Height);
+        itemTooltip->RootNode->SetHeight(windowNode->Height);
         var remainingSpace = ImGuiHelpers.MainViewport.WorkSize.Y - itemTooltip->Y - itemTooltip->GetScaledHeight(true) - 36;
         if (remainingSpace < 0) {
             plugin.Hooks.ItemDetailSetPositionPreservingOriginal(itemTooltip, itemTooltip->X, (short)(itemTooltip->Y + remainingSpace), 1);
@@ -110,7 +165,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         var payloads = new List<Payload>();
         if (lookupState == LookupState.NonMarketable)
             return payloads;
-        if (lookupState == LookupState.Faulted) {
+        if (lookupState == LookupState.Faulted && mbData == null) {
             payloads.Add(new UIForegroundPayload(20));
             payloads.Add(new IconPayload(BitmapFontIcon.Warning));
             payloads.Add(new TextPayload(" " + "Failed to obtain marketboard info.\n        The Universalis API is likely experiencing issues.\n        Please be patient or check the Universalis discord.\n        Press alt to retry or check the /xllog.".Loc()));
@@ -309,6 +364,22 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 payloads.Add(new TextPayload("No marketboard info is known for this item.\nTry opening the ingame marketboard.".Loc()));
                 payloads.Add(new UIForegroundPayload(0));
             }
+
+            // The old data stays visible (original timestamps included) with a status line below
+            // while a forced refresh runs, or after one just failed.
+            if (lookupState == LookupState.Refreshing) {
+                payloads.Add(new UIForegroundPayload(20));
+                payloads.Add(new TextPayload("\n"));
+                payloads.Add(new IconPayload(BitmapFontIcon.LevelSync));
+                payloads.Add(new TextPayload(" " + "Refreshing..".Loc()));
+                payloads.Add(new UIForegroundPayload(0));
+            } else if (lookupState == LookupState.Faulted) {
+                payloads.Add(new UIForegroundPayload(20));
+                payloads.Add(new TextPayload("\n"));
+                payloads.Add(new IconPayload(BitmapFontIcon.Warning));
+                payloads.Add(new TextPayload(" " + "Refresh failed. Universalis is likely experiencing issues.".Loc()));
+                payloads.Add(new UIForegroundPayload(0));
+            }
         }
 
         return payloads;
@@ -335,8 +406,11 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
     }
 
     public void FetchFailed(ICollection<uint> items) {
-        if (!items.Contains((uint)Service.GameGui.HoveredItem % 500000)) return;
-        var newText = ParseMbData(false, null, LookupState.Faulted);
+        var hoveredItem = Service.GameGui.HoveredItem;
+        if (!items.Contains((uint)hoveredItem % 500000)) return;
+        // Keep showing the retained cache entry (if any) with a failure hint instead of wiping it.
+        var cached = plugin.ItemPriceLookup.GetCached(hoveredItem);
+        var newText = ParseMbData(hoveredItem >= 500000, cached, LookupState.Faulted);
         Service.Framework.RunOnFrameworkThread(() => {
             try {
                 var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
@@ -356,6 +430,10 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         unsafe {
             var atkUnitBase = (AtkUnitBase*)Service.GameGui.GetAddonByName("ItemDetail").Address;
             if (atkUnitBase == null)
+                return;
+            // 🔴 NodeListCount 非 0 不保證 NodeList 已配置（同檔另外兩個迴圈都判了，只有這裡漏掉）。
+            // 上界之外還要判指標，否則解參考的是野位址 —— AVE 攔不到。
+            if (atkUnitBase->UldManager.NodeList == null)
                 return;
 
             for (var n = 0; n < atkUnitBase->UldManager.NodeListCount; n++) {

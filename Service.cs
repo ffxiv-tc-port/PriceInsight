@@ -16,6 +16,9 @@ internal class Service {
     [PluginService] internal static IPluginLog PluginLog { get; private set; }
     [PluginService] internal static IGameInteropProvider GameInteropProvider { get; private set; }
     [PluginService] internal static IAddonLifecycle AddonLifecycle { get; private set; }
+    [PluginService] internal static IMarketBoard MarketBoard { get; private set; }
+    [PluginService] internal static IPlayerState PlayerState { get; private set; }
+    [PluginService] internal static IObjectTable ObjectTable { get; private set; }
 
     internal static void Initialize(IDalamudPluginInterface pluginInterface) {
         pluginInterface.Create<Service>();

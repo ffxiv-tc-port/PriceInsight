@@ -3,5 +3,7 @@
 public enum LookupState {
     NonMarketable,
     Marketable,
-    Faulted
+    Faulted,
+    // A cached entry is still shown while a forced refresh is in flight.
+    Refreshing
 }

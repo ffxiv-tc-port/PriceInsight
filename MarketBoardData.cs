@@ -10,6 +10,19 @@ public record MarketBoardData {
     public required string HomeWorld { get; init; }
     public required string Datacenter { get; init; }
     public required string Region { get; init; }
+
+    // True when any scope carries an actual price/sale. A resolved-but-empty entry (Universalis knows
+    // the item but nobody has it listed) returns false so it can be cached briefly and re-fetched sooner.
+    public bool HasAnyData() =>
+        HasData(MinimumPrice) ||
+        HasData(MostRecentPurchase) ||
+        HasData(AverageSalePrice) ||
+        HasData(DailySaleVelocity);
+
+    private static bool HasData<T>(Group<T> group) =>
+        group.World.Nq is not null || group.World.Hq is not null ||
+        group.Datacenter.Nq is not null || group.Datacenter.Hq is not null ||
+        group.Region.Nq is not null || group.Region.Hq is not null;
 }
 
 public record Group<T> {
