@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -17,6 +18,15 @@ public class UniversalisClientV2 : IDisposable {
     private static readonly Dictionary<uint, string> Regions = new() { { 1, "Japan" }, { 2, "North-America" }, { 3, "Europe" }, { 4, "Oceania" } };
     internal static readonly Dictionary<uint, (string Name, string DcName, string Region)> WorldLookup = Service.DataManager.GetExcelSheet<World>()
         .ToDictionary(w => w.RowId, w => (w.Name.ExtractText(), w.DataCenter.Value.Name.ExtractText(), GetRegionName(w)));
+
+    // The World sheet still lists decommissioned and internal worlds, and Universalis answers for
+    // neither. They cannot be told apart from the sheet alone: on the Traditional Chinese service
+    // every world has IsPublic = false, the eight live ones included, so that flag is not a filter,
+    // and UserType/DataCenter are identical across the live and the retired worlds. Universalis is
+    // therefore the only authority available, so remember the world IDs it rejects and stop asking.
+    // Deliberately session-scoped and not persisted: a reload re-probes, so a transient outage
+    // cannot write off a real world for good.
+    private static readonly ConcurrentDictionary<uint, byte> UnrecognizedWorldIds = new();
 
     private readonly HappyEyeballsCallback happyEyeballsCallback;
     private readonly HttpClient httpClient;
@@ -139,7 +149,7 @@ public class UniversalisClientV2 : IDisposable {
         // Keep the fallback bounded to the current data center; on the Traditional Chinese service
         // that data center is also the whole region, so nothing is lost by not widening it.
         var worldIds = WorldLookup
-            .Where(w => w.Value.DcName == homeWorld.DcName)
+            .Where(w => w.Value.DcName == homeWorld.DcName && !UnrecognizedWorldIds.ContainsKey(w.Key))
             .Select(w => w.Key)
             .OrderBy(w => w)
             .ToArray();
@@ -150,7 +160,7 @@ public class UniversalisClientV2 : IDisposable {
         // does; elsewhere it does not, and the region scope must then be reported as "no data" rather
         // than silently equated to the single data center we asked about.
         var regionWorldIds = WorldLookup
-            .Where(w => w.Value.Region == homeWorld.Region)
+            .Where(w => w.Value.Region == homeWorld.Region && !UnrecognizedWorldIds.ContainsKey(w.Key))
             .Select(w => w.Key)
             .ToHashSet();
         var dcCoversRegion = regionWorldIds.SetEquals(worldIds);
@@ -176,9 +186,14 @@ public class UniversalisClientV2 : IDisposable {
                         successfulWorldIds.Add(worldResult.WorldId);
                         partialOverviews.Add(worldResult.Overview);
                     } else if (worldResult.StatusCode == HttpStatusCode.NotFound) {
-                        Service.PluginLog.Warning(
-                            "Universalis does not recognize worldId {0} while retrieving itemId {1}.",
-                            worldResult.WorldId, itemId);
+                        // Write the world off so later lookups never ask again, and report it once
+                        // per session instead of once per item. TryAdd is the throttle: it returns
+                        // true only for a world we had not already recorded.
+                        if (UnrecognizedWorldIds.TryAdd(worldResult.WorldId, 0))
+                            Service.PluginLog.Information(
+                                "Universalis does not recognize worldId {0} ({1}); excluding it from price lookups for the rest of this session.",
+                                worldResult.WorldId,
+                                WorldLookup.TryGetValue(worldResult.WorldId, out var unknownWorld) ? unknownWorld.Name : "?");
                     } else {
                         throw new HttpRequestException(
                             "Invalid fallback status code " + worldResult.StatusCode, null, worldResult.StatusCode);
