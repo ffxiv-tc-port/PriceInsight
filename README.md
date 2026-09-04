@@ -1,11 +1,15 @@
-# FFXIV Price Insight
+# Price Insight
 
-A price insight plugin for FFXIV Quick Launcher / Dalamud using the [Universalis API](https://universalis.app/)
+滑鼠移到道具上時，在提示框下方顯示市場佈告板的 NQ／HQ 價格資訊，資料來自 [Universalis](https://universalis.app/) API。指令 `/priceinsight` 開啟設定視窗。
 
-Whenever you mouseover an item, it will show you the NQ/HQ marketboard prices at the bottom as well as the most recent purchase.
+## 主要功能
 
-![preview](images/image1.png)
+- **即時價格提示**：顯示最低售價、可選擇同時顯示 NQ 與 HQ。
+- **顯示範圍**：可選擇顯示大區、資料中心、伺服器，跨伺服器查詢時可標示所屬資料中心。
+- **最近成交**：可顯示最近一筆購買紀錄，並選擇顯示其大區／伺服器。
+- **銷售統計**：可顯示每日銷售速度、平均售價，範圍可選當前伺服器／資料中心／大區。
+- **整組購買價**：可額外顯示整組（滿疊）售價。
+- **資料時效**：顯示資料的取得時間。
+- **效能選項**：可預先抓取背包道具的價格、可設定用當前所在伺服器查詢、可設定按住 Alt 手動重新整理。
 
-## Installation
-
-Available for install via [Dalamud](https://github.com/goatcorp/FFXIVQuickLauncher)'s built-in plugin installer.
+原作者：[Kouzukii](https://github.com/Kouzukii/ffxiv-priceinsight)
