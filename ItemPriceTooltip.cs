@@ -90,7 +90,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         altWasHeld = altHeld;
         lastEvaluatedItem = hoveredItem;
         var (marketBoardData, lookupState) = plugin.ItemPriceLookup.Get(hoveredItem, refresh);
-        var payloads = ParseMbData(hoveredItem >= 500000, marketBoardData, lookupState);
+        var payloads = ParseMbData(hoveredItem, hoveredItem >= 500000, marketBoardData, lookupState);
         UpdateItemTooltip(itemTooltip, payloads);
     }
 
@@ -161,16 +161,34 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         insertNode->SetYFloat(insertNode->Y + priceNode->AtkResNode.Height + 4);
     }
 
-    private List<Payload> ParseMbData(bool hq, MarketBoardData? mbData, LookupState lookupState) {
+    private List<Payload> ParseMbData(ulong fullItemId, bool hq, MarketBoardData? mbData, LookupState lookupState) {
         var payloads = new List<Payload>();
         if (lookupState == LookupState.NonMarketable)
             return payloads;
+        // Marketbuddy 手上那份本世界的真實掛單。沒裝／查不到一律是 null,下面每一條分支
+        // 都當它不存在照舊跑,所以這條路徑壞掉不會影響原本的 Universalis 顯示。
+        var liveBoard = QueryMarketbuddy(fullItemId);
         if (lookupState == LookupState.Faulted && mbData == null) {
+            // Universalis 掛了,但本世界的實際掛單還在手上——這正是這條來源最有用的時候。
+            if (liveBoard != null) {
+                payloads.Add(new TextPayload("Marketboard Price:".Loc()));
+                AppendMarketbuddyRow(payloads, hq, liveBoard);
+                payloads.Add(new TextPayload("\n"));
+            }
+
             payloads.Add(new UIForegroundPayload(20));
             payloads.Add(new IconPayload(BitmapFontIcon.Warning));
             payloads.Add(new TextPayload(" " + "Failed to obtain marketboard info.\n        The Universalis API is likely experiencing issues.\n        Please be patient or check the Universalis discord.\n        Press alt to retry or check the /xllog.".Loc()));
             payloads.Add(new UIForegroundPayload(0));
         } else if (mbData == null) {
+            // 還在等 Universalis 的時候先把本世界的實際掛單放上去:「為了確認現價再開一次
+            // 市場板」這件事就是在這一刻被省掉的。
+            if (liveBoard != null) {
+                payloads.Add(new TextPayload("Marketboard Price:".Loc()));
+                AppendMarketbuddyRow(payloads, hq, liveBoard);
+                payloads.Add(new TextPayload("\n"));
+            }
+
             payloads.Add(new UIForegroundPayload(20));
             payloads.Add(new IconPayload(BitmapFontIcon.LevelSync));
             payloads.Add(new TextPayload(" " + "Marketboard info is being obtained..".Loc()));
@@ -272,6 +290,12 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                     var recentTime = hq ? mbData.MinimumPrice.World.Hq?.Time : mbData.MinimumPrice.World.Nq?.Time;
                     PrintTime(recentTime);
                 }
+            }
+
+            // 排在本服最低價底下:同一個世界的兩個來源並列,語意差異由列上的標籤說明。
+            if (liveBoard != null) {
+                PriceHeader();
+                AppendMarketbuddyRow(payloads, hq, liveBoard);
             }
 
             var recentHeader = false;
@@ -388,7 +412,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
     public void Refresh(IDictionary<uint, MarketBoardData> mbData) {
         if (Service.GameGui.HoveredItem >= 2000000) return;
         if (mbData.TryGetValue((uint)(Service.GameGui.HoveredItem % 500000), out var data)) {
-            var newText = ParseMbData(Service.GameGui.HoveredItem >= 500000, data, LookupState.Marketable);
+            var newText = ParseMbData(Service.GameGui.HoveredItem, Service.GameGui.HoveredItem >= 500000, data, LookupState.Marketable);
             Service.Framework.RunOnFrameworkThread(() => {
                 try {
                     var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
@@ -410,7 +434,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         if (!items.Contains((uint)hoveredItem % 500000)) return;
         // Keep showing the retained cache entry (if any) with a failure hint instead of wiping it.
         var cached = plugin.ItemPriceLookup.GetCached(hoveredItem);
-        var newText = ParseMbData(hoveredItem >= 500000, cached, LookupState.Faulted);
+        var newText = ParseMbData(hoveredItem, hoveredItem >= 500000, cached, LookupState.Faulted);
         Service.Framework.RunOnFrameworkThread(() => {
             try {
                 var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
@@ -453,6 +477,85 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// 問 Marketbuddy 這件道具在本世界最近看到的真實掛單。關掉設定、非道具、沒裝
+    /// Marketbuddy、或它沒看過這件道具,一律回 <c>null</c>。
+    /// </summary>
+    private MarketbuddyListings? QueryMarketbuddy(ulong fullItemId) {
+        if (!plugin.Configuration.ShowMarketbuddyListings)
+            return null;
+        // 與 ItemPriceLookup.ToMarketableItemId 相同的界線:2000000 以上不是道具。
+        if (fullItemId >= 2000000)
+            return null;
+        return plugin.MarketbuddyBridge.Query((uint)(fullItemId % 500000));
+    }
+
+    /// <summary>
+    /// 印出「Marketbuddy 在市場佈告板上實際看到的掛單」那一列。
+    /// </summary>
+    /// <remarks>
+    /// 🔴 這一列的資料來源與其餘各列<b>完全不同</b>:上面幾列是 Universalis(跨資料中心、
+    /// 群眾上傳、可能好幾天前),這一列是本世界、被動收集、真的在板子上看到過的掛單。
+    /// ⇒ 列上必須同時寫出<b>世界名</b>與 <b>Marketbuddy</b>,不能只是多一個價格。
+    /// <para>
+    /// 🔴 <b>年紀永遠印出來</b>,不跟著「顯示資料更新時間」那個設定走:這份資料最舊可以到
+    /// 1 小時前,沒有年紀的話使用者沒辦法判斷該不該相信它——那比不顯示更糟。
+    /// </para>
+    /// <para>
+    /// ⚠️ 刻意<b>不印筆數</b>:提供端拿到的是第一頁,「共 N 件」會是錯的。
+    /// </para>
+    /// </remarks>
+    private void AppendMarketbuddyRow(List<Payload> payloads, bool hq, MarketbuddyListings snapshot) {
+        // 查不到世界名時印 ? 而不是留白:「不知道」本身要看得見。
+        var worldName = UniversalisClientV2.WorldLookup.TryGetValue(snapshot.WorldId, out var world)
+            ? world.Name
+            : "?";
+        payloads.Add(new TextPayload("\n  Board (??, Marketbuddy)".Loc(worldName) + ": "));
+
+        if (snapshot.ConfirmedEmpty) {
+            // Marketbuddy 走完流程確認過沒人在賣——這是 Universalis 推不出來的資訊。
+            payloads.Add(new UIForegroundPayload(20));
+            payloads.Add(new TextPayload("nobody is selling this".Loc()));
+            payloads.Add(new UIForegroundPayload(0));
+        } else {
+            // 🔴 0 代表「這個品質沒有掛單」,不是免費。
+            var nqPrice = snapshot.LowestPriceNq == 0 ? (uint?)null : snapshot.LowestPriceNq;
+            var hqPrice = snapshot.LowestPriceHq == 0 ? (uint?)null : snapshot.LowestPriceHq;
+            var showNq = nqPrice != null && (plugin.Configuration.ShowBothNqAndHq || !hq);
+            var showHq = hqPrice != null && (plugin.Configuration.ShowBothNqAndHq || hq);
+
+            if (!showNq && !showHq) {
+                // 有資料,但看到的全是另一種品質。留白會被讀成「沒查到」,所以明講。
+                payloads.Add(new UIForegroundPayload(20));
+                payloads.Add(new TextPayload("no listing of this quality".Loc()));
+                payloads.Add(new UIForegroundPayload(0));
+            } else {
+                if (showNq) {
+                    if (!hq)
+                        payloads.Add(new UIForegroundPayload(506));
+                    payloads.Add(new TextPayload($"{nqPrice!.Value.ToString("N0", FormatProvider)}{GilIcon}"));
+                    if (!hq)
+                        payloads.Add(new UIForegroundPayload(0));
+                }
+
+                if (showHq) {
+                    if (showNq)
+                        payloads.Add(new TextPayload("/"));
+                    if (hq)
+                        payloads.Add(new UIForegroundPayload(506));
+                    payloads.Add(new TextPayload($"{HQIcon}{hqPrice!.Value.ToString("N0", FormatProvider)}{GilIcon}"));
+                    if (hq)
+                        payloads.Add(new UIForegroundPayload(0));
+                }
+            }
+        }
+
+        var observed = DateTimeOffset.FromUnixTimeMilliseconds(snapshot.ObservedAtUnixMs).LocalDateTime;
+        payloads.Add(new UIForegroundPayload(20));
+        payloads.Add(new TextPayload($" ({PrintDuration(DateTime.Now - observed)})"));
+        payloads.Add(new UIForegroundPayload(0));
     }
 
     private static string PrintDuration(TimeSpan span) {

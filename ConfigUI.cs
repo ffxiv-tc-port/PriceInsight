@@ -137,6 +137,16 @@ internal class ConfigUI(PriceInsightPlugin plugin) : IDisposable {
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Show the datacenter for worlds from other datacenters when displaying prices for the entire region.\nCan be turned off to reduce tooltip bloat.".Loc());
 
+            configValue = conf.ShowMarketbuddyListings;
+            if (ImGui.Checkbox("Show live listings from Marketbuddy".Loc(), ref configValue)) {
+                conf.ShowMarketbuddyListings = configValue;
+                conf.Save();
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(
+                    "Marketbuddy passively remembers the real listings it has seen on the market board for the world you are on (up to 1 hour).\nThose are real, world-local prices; Universalis is crowd-uploaded and can be days old.\nHas no effect when Marketbuddy is not installed."
+                        .Loc());
+
             configValue = conf.ShowBothNqAndHq;
             if (ImGui.Checkbox("Always display NQ and HQ prices".Loc(), ref configValue)) {
                 conf.ShowBothNqAndHq = configValue;

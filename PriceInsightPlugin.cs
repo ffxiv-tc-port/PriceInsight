@@ -16,6 +16,9 @@ public class PriceInsightPlugin : IDalamudPlugin {
     public ItemPriceLookup ItemPriceLookup { get; private set; }
     public UniversalisClientV2 UniversalisClientV2 { get; }
 
+    /// <summary>Marketbuddy 被動市場快取的讀取端(沒裝時每次查詢一律靜默回 null)。</summary>
+    internal MarketbuddyBridge MarketbuddyBridge { get; }
+
     private readonly ConfigUI configUi;
 
     public PriceInsightPlugin(IDalamudPluginInterface pluginInterface) {
@@ -25,6 +28,9 @@ public class PriceInsightPlugin : IDalamudPlugin {
         Configuration = Configuration.Get(pluginInterface);
 
         UniversalisClientV2 = new UniversalisClientV2();
+        // 🔴 必須排在 ItemPriceTooltip 之前:提示視窗一被畫就會用到它。
+        //    建構子只是把 CallGate 的訂閱物件拿到手,不會去呼叫 Marketbuddy。
+        MarketbuddyBridge = new MarketbuddyBridge(pluginInterface);
         ItemPriceLookup = new ItemPriceLookup(this);
         ItemPriceTooltip = new ItemPriceTooltip(this);
         Hooks = new Hooks(this);
