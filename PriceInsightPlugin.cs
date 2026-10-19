@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Command;
+using Dalamud.Game.Network.Structures;
 using Dalamud.Plugin;
 using FFXIVClientStructs.FFXIV.Client.Game;
 
@@ -15,20 +16,29 @@ public class PriceInsightPlugin : IDalamudPlugin {
     public ItemPriceLookup ItemPriceLookup { get; private set; }
     public UniversalisClientV2 UniversalisClientV2 { get; }
 
+    /// <summary>Marketbuddy 被動市場快取的讀取端(沒裝時每次查詢一律靜默回 null)。</summary>
+    internal MarketbuddyBridge MarketbuddyBridge { get; }
+
+    public ItemConversions ItemConversions { get; } = new();
+
     private readonly ConfigUI configUi;
 
     public PriceInsightPlugin(IDalamudPluginInterface pluginInterface) {
         Service.Initialize(pluginInterface);
+        Localization.Init(pluginInterface.AssemblyLocation.DirectoryName);
 
         Configuration = Configuration.Get(pluginInterface);
 
         UniversalisClientV2 = new UniversalisClientV2();
+        // 🔴 必須排在 ItemPriceTooltip 之前:提示視窗一被畫就會用到它。
+        //    建構子只是把 CallGate 的訂閱物件拿到手,不會去呼叫 Marketbuddy。
+        MarketbuddyBridge = new MarketbuddyBridge(pluginInterface);
         ItemPriceLookup = new ItemPriceLookup(this);
         ItemPriceTooltip = new ItemPriceTooltip(this);
         Hooks = new Hooks(this);
         configUi = new ConfigUI(this);
 
-        Service.CommandManager.AddHandler("/priceinsight", new CommandInfo((_, _) => OpenConfigUI()) { HelpMessage = "Price Insight Configuration Menu" });
+        Service.CommandManager.AddHandler("/priceinsight", new CommandInfo((_, _) => OpenConfigUI()) { HelpMessage = "Price Insight Configuration Menu".Loc() });
 
         Service.AddonLifecycle.RegisterListener(AddonEvent.PostRequestedUpdate, ["Inventory", "InventoryLarge", "InventoryExpansion"], HandleInventoryUpdate);
         Service.AddonLifecycle.RegisterListener(AddonEvent.PreSetup, "InventoryBuddy", HandleSaddlebagOpen);
@@ -38,6 +48,24 @@ public class PriceInsightPlugin : IDalamudPlugin {
         pluginInterface.UiBuilder.OpenConfigUi += OpenConfigUI;
         Service.ClientState.Logout += ClearCache;
         Service.ClientState.Login += ClientOnLogin;
+        Service.MarketBoard.OfferingsReceived += MarketBoardOnOfferingsReceived;
+        Service.MarketBoard.HistoryReceived += MarketBoardOnHistoryReceived;
+    }
+
+    private void MarketBoardOnOfferingsReceived(IMarketBoardCurrentOfferings currentOfferings) {
+        try {
+            ItemPriceLookup.ApplyMarketBoardOfferings(currentOfferings);
+        } catch (Exception e) {
+            Service.PluginLog.Error(e, "Failed to apply market board offerings to the price cache");
+        }
+    }
+
+    private void MarketBoardOnHistoryReceived(IMarketBoardHistory history) {
+        try {
+            ItemPriceLookup.ApplyMarketBoardHistory(history);
+        } catch (Exception e) {
+            Service.PluginLog.Error(e, "Failed to apply market board history to the price cache");
+        }
     }
 
     private void ClientOnLogin() {
@@ -89,8 +117,11 @@ public class PriceInsightPlugin : IDalamudPlugin {
                     for (var i = 0; i < container->Size; i++) {
                         var item = &container->Items[i];
                         var itemId = item->ItemId;
-                        if (itemId != 0)
-                            items.Add(itemId);
+                        if (itemId == 0)
+                            continue;
+                        if (Configuration.ShowConvertedItemPrices && ItemConversions.TryGet(itemId, out var conversion))
+                            itemId = conversion.TargetItemId;
+                        items.Add(itemId);
                     }
                 }
             }
@@ -112,6 +143,8 @@ public class PriceInsightPlugin : IDalamudPlugin {
         Service.CommandManager.RemoveHandler("/priceinsight");
         Service.ClientState.Logout -= ClearCache;
         Service.ClientState.Login -= ClientOnLogin;
+        Service.MarketBoard.OfferingsReceived -= MarketBoardOnOfferingsReceived;
+        Service.MarketBoard.HistoryReceived -= MarketBoardOnHistoryReceived;
         Hooks.Dispose();
         ItemPriceTooltip.Dispose();
         ItemPriceLookup.Dispose();

@@ -15,41 +15,105 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
     private const int NodeId = 32612;
     private const char HQIcon = '';
     private const char GilIcon = '';
+    private const ushort ConversionColor = 31;
 
     public int? LastItemQuantity;
+
+    // Alt edge-trigger state: refresh fires once when alt goes down (or when a new item is
+    // hovered with alt already held), never continuously while alt stays held.
+    private bool altWasHeld;
+    private ulong lastEvaluatedItem;
 
     private static readonly CultureInfo FormatProvider = CultureInfo.CurrentCulture.NumberFormat.NumberGroupSeparator == "\u2009"
         ? CultureInfo.InvariantCulture
         : CultureInfo.CurrentCulture;
 
+    /// <summary>
+    /// Resolves the two sibling nodes that mirror the tooltip window height.
+    /// Returns false when any link in the chain is missing.
+    /// </summary>
+    /// <remarks>itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode 是一條四層裸鏈,
+    /// 任何一層是 null 都會解參考,而 AtkResNode.SetHeight 是 [MemberFunction]
+    /// 原生呼叫、對 null 呼叫即 AccessViolationException —— 那在 .NET Core 屬於
+    /// corrupted-state exception,try/catch 完全攔不到。
+    /// 失敗時的行為是「不調整高度」,提示視窗版面會不對但不會崩。
+    /// </remarks>
+    private static unsafe bool TryGetWindowHeightNodes(AtkUnitBase* itemTooltip, out AtkComponentNode* windowNode,
+        out AtkResNode* rootNode, out AtkResNode* prevSiblingNode) {
+        windowNode = null;
+        rootNode = null;
+        prevSiblingNode = null;
+
+        if (itemTooltip == null)
+            return false;
+
+        windowNode = itemTooltip->WindowNode;
+        if (windowNode == null)
+            return false;
+
+        var component = windowNode->Component;
+        if (component == null)
+            return false;
+
+        rootNode = component->UldManager.RootNode;
+        if (rootNode == null)
+            return false;
+
+        prevSiblingNode = rootNode->PrevSiblingNode;
+        return prevSiblingNode != null;
+    }
+
     public static unsafe void RestoreToNormal(AtkUnitBase* itemTooltip) {
+        if (itemTooltip == null || itemTooltip->UldManager.NodeList == null)
+            return;
         for (var i = 0; i < itemTooltip->UldManager.NodeListCount; i++) {
             var n = itemTooltip->UldManager.NodeList[i];
-            if (n->NodeId != NodeId || !n->IsVisible())
+            if (n == null || n->NodeId != NodeId || !n->IsVisible())
                 continue;
             n->ToggleVisibility(false);
             var insertNode = itemTooltip->GetNodeById(2);
             if (insertNode == null)
                 return;
-            itemTooltip->WindowNode->AtkResNode.SetHeight((ushort)(itemTooltip->WindowNode->AtkResNode.Height - n->Height - 4));
-            itemTooltip->WindowNode->Component->UldManager.RootNode->SetHeight(itemTooltip->WindowNode->AtkResNode.Height);
-            itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode->SetHeight(itemTooltip->WindowNode->AtkResNode.Height);
+            if (!TryGetWindowHeightNodes(itemTooltip, out var windowNode, out var rootNode, out var prevSiblingNode))
+                return;
+            windowNode->AtkResNode.SetHeight((ushort)(windowNode->AtkResNode.Height - n->Height - 4));
+            rootNode->SetHeight(windowNode->AtkResNode.Height);
+            prevSiblingNode->SetHeight(windowNode->AtkResNode.Height);
             insertNode->SetYFloat(insertNode->Y - n->Height - 4);
             break;
         }
     }
 
     public unsafe void OnItemTooltip(AtkUnitBase* itemTooltip) {
-        var refresh = plugin.Configuration.RefreshWithAlt && Service.KeyState[VirtualKey.MENU];
-        var (marketBoardData, lookupState) = plugin.ItemPriceLookup.Get(Service.GameGui.HoveredItem, refresh);
-        var payloads = ParseMbData(Service.GameGui.HoveredItem >= 500000, marketBoardData, lookupState);
+        var hoveredItem = Service.GameGui.HoveredItem;
+        var altHeld = plugin.Configuration.RefreshWithAlt && Service.KeyState[VirtualKey.MENU];
+        var refresh = altHeld && (!altWasHeld || lastEvaluatedItem != hoveredItem);
+        altWasHeld = altHeld;
+        lastEvaluatedItem = hoveredItem;
+        var (itemId, conversion) = ResolveHovered(hoveredItem);
+        var (marketBoardData, lookupState) = plugin.ItemPriceLookup.Get(itemId, refresh);
+        var payloads = ParseMbData(itemId, itemId >= 500000, marketBoardData, lookupState, conversion);
         UpdateItemTooltip(itemTooltip, payloads);
+    }
+
+    // Swaps an unsellable hovered item for the item it can be exchanged for, when enabled.
+    private (ulong ItemId, ItemConversion? Conversion) ResolveHovered(ulong hoveredItem) {
+        if (plugin.Configuration.ShowConvertedItemPrices && hoveredItem < 500000 && plugin.ItemConversions.TryGet((uint)hoveredItem, out var conversion))
+            return (conversion.TargetItemId, conversion);
+        return (hoveredItem, null);
     }
 
     private unsafe void UpdateItemTooltip(AtkUnitBase* itemTooltip, List<Payload> payloads) {
         if (payloads.Count == 0) {
             return;
         }
+
+        // 先確定整條高度調整鏈都在,再開始改任何東西。
+        // 這樣失敗時是「這次不顯示價格」,而不是改到一半、讓 RestoreToNormal 反向補償出錯位。
+        if (itemTooltip == null || itemTooltip->UldManager.NodeList == null || itemTooltip->RootNode == null)
+            return;
+        if (!TryGetWindowHeightNodes(itemTooltip, out var windowNode, out var windowRootNode, out var windowPrevSiblingNode))
+            return;
 
         AtkTextNode* priceNode = null;
         for (var i = 0; i < itemTooltip->UldManager.NodeListCount; i++) {
@@ -92,33 +156,69 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         priceNode->AtkResNode.ToggleVisibility(true);
         priceNode->SetText(new SeString(payloads).Encode());
         priceNode->ResizeNodeForCurrentText();
-        priceNode->AtkResNode.SetYFloat(itemTooltip->WindowNode->AtkResNode.Height - 8);
-        itemTooltip->WindowNode->SetHeight((ushort)(itemTooltip->WindowNode->AtkResNode.Height + priceNode->AtkResNode.Height + 4));
-        itemTooltip->WindowNode->AtkResNode.SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->WindowNode->Component->UldManager.RootNode->SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->WindowNode->Component->UldManager.RootNode->PrevSiblingNode->SetHeight(itemTooltip->WindowNode->Height);
-        itemTooltip->RootNode->SetHeight(itemTooltip->WindowNode->Height);
+        priceNode->AtkResNode.SetYFloat(windowNode->AtkResNode.Height - 8);
+        windowNode->SetHeight((ushort)(windowNode->AtkResNode.Height + priceNode->AtkResNode.Height + 4));
+        windowNode->AtkResNode.SetHeight(windowNode->Height);
+        windowRootNode->SetHeight(windowNode->Height);
+        windowPrevSiblingNode->SetHeight(windowNode->Height);
+        itemTooltip->RootNode->SetHeight(windowNode->Height);
         var remainingSpace = ImGuiHelpers.MainViewport.WorkSize.Y - itemTooltip->Y - itemTooltip->GetScaledHeight(true) - 36;
         if (remainingSpace < 0) {
-            plugin.Hooks.ItemDetailSetPositionPreservingOriginal(itemTooltip, itemTooltip->X, (short)(itemTooltip->Y + remainingSpace), 1);
+            // 特徵碼對不上時是 null：這次不上移（下緣可能超出畫面）。呼叫 null 函式指標攔不到。
+            var setPosition = plugin.Hooks.ItemDetailSetPositionPreservingOriginal;
+            if (setPosition != null)
+                setPosition(itemTooltip, itemTooltip->X, (short)(itemTooltip->Y + remainingSpace), 1);
         }
 
         insertNode->SetYFloat(insertNode->Y + priceNode->AtkResNode.Height + 4);
     }
 
-    private List<Payload> ParseMbData(bool hq, MarketBoardData? mbData, LookupState lookupState) {
+    private List<Payload> ParseMbData(ulong fullItemId, bool hq, MarketBoardData? mbData, LookupState lookupState, ItemConversion? conversion) {
+        var payloads = ParseMbDataCore(fullItemId, hq, mbData, lookupState, conversion);
+        if (conversion != null && payloads.Count > 0) {
+            payloads.InsertRange(0, [
+                new UIForegroundPayload(ConversionColor),
+                new TextPayload("After inspection, ?? of these become 1 ??. Prices below are for that item:".Loc(conversion.AmountRequired, conversion.TargetName) + "\n"),
+                new UIForegroundPayload(0),
+            ]);
+        }
+
+        return payloads;
+    }
+
+    private List<Payload> ParseMbDataCore(ulong fullItemId, bool hq, MarketBoardData? mbData, LookupState lookupState, ItemConversion? conversion) {
         var payloads = new List<Payload>();
         if (lookupState == LookupState.NonMarketable)
             return payloads;
-        if (lookupState == LookupState.Faulted) {
+        // A stack of the source item only becomes this many of the priced item.
+        var stackQuantity = conversion == null ? LastItemQuantity : LastItemQuantity / (int)conversion.AmountRequired;
+        // Marketbuddy 手上那份本世界的真實掛單。沒裝／查不到一律是 null,下面每一條分支
+        // 都當它不存在照舊跑,所以這條路徑壞掉不會影響原本的 Universalis 顯示。
+        var liveBoard = QueryMarketbuddy(fullItemId);
+        if (lookupState == LookupState.Faulted && mbData == null) {
+            // Universalis 掛了,但本世界的實際掛單還在手上——這正是這條來源最有用的時候。
+            if (liveBoard != null) {
+                payloads.Add(new TextPayload("Marketboard Price:".Loc()));
+                AppendMarketbuddyRow(payloads, hq, liveBoard);
+                payloads.Add(new TextPayload("\n"));
+            }
+
             payloads.Add(new UIForegroundPayload(20));
             payloads.Add(new IconPayload(BitmapFontIcon.Warning));
-            payloads.Add(new TextPayload(" Failed to obtain marketboard info.\n        The Universalis API is likely experiencing issues.\n        Please be patient or check the Universalis discord.\n        Press alt to retry or check the /xllog."));
+            payloads.Add(new TextPayload(" " + "Failed to obtain marketboard info.\n        The Universalis API is likely experiencing issues.\n        Please be patient or check the Universalis discord.\n        Press alt to retry or check the /xllog.".Loc()));
             payloads.Add(new UIForegroundPayload(0));
         } else if (mbData == null) {
+            // 還在等 Universalis 的時候先把本世界的實際掛單放上去:「為了確認現價再開一次
+            // 市場板」這件事就是在這一刻被省掉的。
+            if (liveBoard != null) {
+                payloads.Add(new TextPayload("Marketboard Price:".Loc()));
+                AppendMarketbuddyRow(payloads, hq, liveBoard);
+                payloads.Add(new TextPayload("\n"));
+            }
+
             payloads.Add(new UIForegroundPayload(20));
             payloads.Add(new IconPayload(BitmapFontIcon.LevelSync));
-            payloads.Add(new TextPayload(" Marketboard info is being obtained.."));
+            payloads.Add(new TextPayload(" " + "Marketboard info is being obtained..".Loc()));
             payloads.Add(new UIForegroundPayload(0));
         } else {
             var ownWorld = mbData.HomeWorld;
@@ -129,7 +229,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             var priceHeader = false;
             void PriceHeader() {
                 if (priceHeader) return;
-                payloads.Add(new TextPayload("Marketboard Price:"));
+                payloads.Add(new TextPayload("Marketboard Price:".Loc()));
                 priceHeader = true;
             }
 
@@ -138,8 +238,8 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                     if (!hq)
                         payloads.Add(new UIForegroundPayload(506));
                     payloads.Add(new TextPayload($"{nqPrice.Value.ToString(format, FormatProvider)}{(withGilIcon ? GilIcon : "")}"));
-                    if (plugin.Configuration.ShowStackSalePrice && !hq && LastItemQuantity > 1 && withGilIcon)
-                        payloads.Add(new TextPayload($" ({(nqPrice.Value * T.CreateChecked(LastItemQuantity.Value)).ToString(format, FormatProvider)}{GilIcon})"));
+                    if (plugin.Configuration.ShowStackSalePrice && !hq && stackQuantity > 1 && withGilIcon)
+                        payloads.Add(new TextPayload($" ({(nqPrice.Value * T.CreateChecked(stackQuantity.Value)).ToString(format, FormatProvider)}{GilIcon})"));
                     if (!hq)
                         payloads.Add(new UIForegroundPayload(0));
                 }
@@ -150,8 +250,8 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                     if (hq)
                         payloads.Add(new UIForegroundPayload(506));
                     payloads.Add(new TextPayload($"{HQIcon}{hqPrice.Value.ToString(format, FormatProvider)}{(withGilIcon ? GilIcon : "")}"));
-                    if (plugin.Configuration.ShowStackSalePrice && hq && LastItemQuantity > 1 && withGilIcon)
-                        payloads.Add(new TextPayload($" ({(hqPrice.Value * T.CreateChecked(LastItemQuantity.Value)).ToString(format, FormatProvider)}{GilIcon})"));
+                    if (plugin.Configuration.ShowStackSalePrice && hq && stackQuantity > 1 && withGilIcon)
+                        payloads.Add(new TextPayload($" ({(hqPrice.Value * T.CreateChecked(stackQuantity.Value)).ToString(format, FormatProvider)}{GilIcon})"));
                     if (hq)
                         payloads.Add(new UIForegroundPayload(0));
                 }
@@ -179,7 +279,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                     ? mbData.MinimumPrice.Region.Hq?.World ?? mbData.MinimumPrice.Region.Nq?.World
                     : mbData.MinimumPrice.Region.Nq?.World ?? mbData.MinimumPrice.Region.Hq?.World;
 
-                payloads.Add(new TextPayload("\n  Cheapest ("));
+                payloads.Add(new TextPayload("\n  Cheapest (".Loc()));
                 payloads.Add(new IconPayload(BitmapFontIcon.CrossWorld));
                 payloads.Add(new TextPayload($"{minWorldRegion}"));
                 if (plugin.Configuration.ShowDatacenterOnCrossWorlds)
@@ -196,7 +296,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (minWorld != ownWorld && minWorld != null && (plugin.Configuration.ShowDatacenter || (plugin.Configuration.ShowRegion && minDc == ownDc))) {
                 PriceHeader();
 
-                payloads.Add(new TextPayload("\n  Cheapest ("));
+                payloads.Add(new TextPayload("\n  Cheapest (".Loc()));
                 payloads.Add(new IconPayload(BitmapFontIcon.CrossWorld));
                 payloads.Add(new TextPayload($"{minWorld}): "));
                 PrintNqHq(mbData.MinimumPrice.Datacenter.Nq?.Price, mbData.MinimumPrice.Datacenter.Hq?.Price);
@@ -210,7 +310,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (GetNqHqData(mbData.MinimumPrice.World.Nq,  mbData.MinimumPrice.World.Hq) != null && (plugin.Configuration.ShowWorld || (plugin.Configuration.ShowDatacenter && minWorld == ownWorld))) {
                 PriceHeader();
 
-                payloads.Add(new TextPayload($"\n  Home ({ownWorld}): "));
+                payloads.Add(new TextPayload("\n  Home (??)".Loc(ownWorld) + ": "));
                 PrintNqHq(mbData.MinimumPrice.World.Nq?.Price, mbData.MinimumPrice.World.Hq?.Price);
 
                 if (plugin.Configuration.ShowAge) {
@@ -219,12 +319,18 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 }
             }
 
+            // 排在本服最低價底下:同一個世界的兩個來源並列,語意差異由列上的標籤說明。
+            if (liveBoard != null) {
+                PriceHeader();
+                AppendMarketbuddyRow(payloads, hq, liveBoard);
+            }
+
             var recentHeader = false;
             void RecentHeader() {
                 if (recentHeader) return;
                 if (payloads.Count > 0)
                     payloads.Add(new TextPayload("\n"));
-                payloads.Add(new TextPayload("Most Recent Purchase:"));
+                payloads.Add(new TextPayload("Most Recent Purchase:".Loc()));
                 recentHeader = true;
             }
 
@@ -237,7 +343,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                     ? mbData.MostRecentPurchase.Region.Hq?.World ?? mbData.MostRecentPurchase.Region.Nq?.World
                     : mbData.MostRecentPurchase.Region.Nq?.World ?? mbData.MostRecentPurchase.Region.Hq?.World;
 
-                payloads.Add(new TextPayload("\n  Region ("));
+                payloads.Add(new TextPayload("\n  Region (".Loc()));
                 payloads.Add(new IconPayload(BitmapFontIcon.CrossWorld));
                 payloads.Add(new TextPayload($"{recentWorldRegion} {recentDc}): "));
                 PrintNqHq(mbData.MostRecentPurchase.Region.Nq?.Price, mbData.MostRecentPurchase.Region.Hq?.Price);
@@ -251,7 +357,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (recentWorld != ownWorld && recentWorld != null && (plugin.Configuration.ShowMostRecentPurchase || (plugin.Configuration.ShowMostRecentPurchaseRegion && recentDc == ownDc))) {
                 RecentHeader();
 
-                payloads.Add(new TextPayload("\n  Datacenter ("));
+                payloads.Add(new TextPayload("\n  Datacenter (".Loc()));
                 payloads.Add(new IconPayload(BitmapFontIcon.CrossWorld));
                 payloads.Add(new TextPayload($"{recentWorld}): "));
                 PrintNqHq(mbData.MostRecentPurchase.Datacenter.Nq?.Price, mbData.MostRecentPurchase.Datacenter.Hq?.Price);
@@ -265,7 +371,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (GetNqHqData(mbData.MostRecentPurchase.World.Nq, mbData.MostRecentPurchase.World.Hq) != null && (plugin.Configuration.ShowMostRecentPurchaseWorld || (plugin.Configuration.ShowMostRecentPurchase && recentWorld == ownWorld))) {
                 RecentHeader();
 
-                payloads.Add(new TextPayload($"\n  Home ({ownWorld}): "));
+                payloads.Add(new TextPayload("\n  Home (??)".Loc(ownWorld) + ": "));
                 PrintNqHq(mbData.MostRecentPurchase.World.Nq?.Price, mbData.MostRecentPurchase.World.Hq?.Price);
 
                 if (plugin.Configuration.ShowAge) {
@@ -284,7 +390,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 if (salePrice != null && GetNqHqData(salePrice.Nq, salePrice.Hq) != null) {
                     if (payloads.Count > 0)
                         payloads.Add(new TextPayload("\n"));
-                    payloads.Add(new TextPayload($"Average sale price ({scope}): "));
+                    payloads.Add(new TextPayload("Average sale price (??)".Loc(scope) + ": "));
                     PrintNqHq(salePrice.Nq, salePrice.Hq);
                 }
             }
@@ -299,14 +405,30 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                 if (saleVelocity != null && GetNqHqData(saleVelocity.Nq, saleVelocity.Hq) != null) {
                     if (payloads.Count > 0)
                         payloads.Add(new TextPayload("\n"));
-                    payloads.Add(new TextPayload($"Sales per day ({scope}): "));
+                    payloads.Add(new TextPayload("Sales per day (??)".Loc(scope) + ": "));
                     PrintNqHq(saleVelocity.Nq, saleVelocity.Hq, format: "N1", withGilIcon: false);
                 }
             }
 
             if (payloads.Count == 0) {
                 payloads.Add(new UIForegroundPayload(20));
-                payloads.Add(new TextPayload("No marketboard info is known for this item.\nTry opening the ingame marketboard."));
+                payloads.Add(new TextPayload("No marketboard info is known for this item.\nTry opening the ingame marketboard.".Loc()));
+                payloads.Add(new UIForegroundPayload(0));
+            }
+
+            // The old data stays visible (original timestamps included) with a status line below
+            // while a forced refresh runs, or after one just failed.
+            if (lookupState == LookupState.Refreshing) {
+                payloads.Add(new UIForegroundPayload(20));
+                payloads.Add(new TextPayload("\n"));
+                payloads.Add(new IconPayload(BitmapFontIcon.LevelSync));
+                payloads.Add(new TextPayload(" " + "Refreshing..".Loc()));
+                payloads.Add(new UIForegroundPayload(0));
+            } else if (lookupState == LookupState.Faulted) {
+                payloads.Add(new UIForegroundPayload(20));
+                payloads.Add(new TextPayload("\n"));
+                payloads.Add(new IconPayload(BitmapFontIcon.Warning));
+                payloads.Add(new TextPayload(" " + "Refresh failed. Universalis is likely experiencing issues.".Loc()));
                 payloads.Add(new UIForegroundPayload(0));
             }
         }
@@ -316,8 +438,9 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
 
     public void Refresh(IDictionary<uint, MarketBoardData> mbData) {
         if (Service.GameGui.HoveredItem >= 2000000) return;
-        if (mbData.TryGetValue((uint)(Service.GameGui.HoveredItem % 500000), out var data)) {
-            var newText = ParseMbData(Service.GameGui.HoveredItem >= 500000, data, LookupState.Marketable);
+        var (itemId, conversion) = ResolveHovered(Service.GameGui.HoveredItem);
+        if (mbData.TryGetValue((uint)(itemId % 500000), out var data)) {
+            var newText = ParseMbData(itemId, itemId >= 500000, data, LookupState.Marketable, conversion);
             Service.Framework.RunOnFrameworkThread(() => {
                 try {
                     var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
@@ -335,8 +458,11 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
     }
 
     public void FetchFailed(ICollection<uint> items) {
-        if (!items.Contains((uint)Service.GameGui.HoveredItem % 500000)) return;
-        var newText = ParseMbData(false, null, LookupState.Faulted);
+        var (hoveredItem, conversion) = ResolveHovered(Service.GameGui.HoveredItem);
+        if (!items.Contains((uint)hoveredItem % 500000)) return;
+        // Keep showing the retained cache entry (if any) with a failure hint instead of wiping it.
+        var cached = plugin.ItemPriceLookup.GetCached(hoveredItem);
+        var newText = ParseMbData(hoveredItem, hoveredItem >= 500000, cached, LookupState.Faulted, conversion);
         Service.Framework.RunOnFrameworkThread(() => {
             try {
                 var tooltip = Service.GameGui.GetAddonByName("ItemDetail");
@@ -356,6 +482,10 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         unsafe {
             var atkUnitBase = (AtkUnitBase*)Service.GameGui.GetAddonByName("ItemDetail").Address;
             if (atkUnitBase == null)
+                return;
+            // 🔴 NodeListCount 非 0 不保證 NodeList 已配置（同檔另外兩個迴圈也都判了）。
+            // 上界之外還要判指標，否則解參考的是野位址 —— AVE 攔不到。
+            if (atkUnitBase->UldManager.NodeList == null)
                 return;
 
             for (var n = 0; n < atkUnitBase->UldManager.NodeListCount; n++) {
@@ -377,14 +507,93 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         }
     }
 
+    /// <summary>
+    /// 問 Marketbuddy 這件道具在本世界最近看到的真實掛單。關掉設定、非道具、沒裝
+    /// Marketbuddy、或它沒看過這件道具,一律回 <c>null</c>。
+    /// </summary>
+    private MarketbuddyListings? QueryMarketbuddy(ulong fullItemId) {
+        if (!plugin.Configuration.ShowMarketbuddyListings)
+            return null;
+        // 與 ItemPriceLookup.ToMarketableItemId 相同的界線:2000000 以上不是道具。
+        if (fullItemId >= 2000000)
+            return null;
+        return plugin.MarketbuddyBridge.Query((uint)(fullItemId % 500000));
+    }
+
+    /// <summary>
+    /// 印出「Marketbuddy 在市場佈告板上實際看到的掛單」那一列。
+    /// </summary>
+    /// <remarks>
+    /// 🔴 這一列的資料來源與其餘各列<b>完全不同</b>:上面幾列是 Universalis(跨資料中心、
+    /// 群眾上傳、可能好幾天前),這一列是本世界、被動收集、真的在板子上看到過的掛單。
+    /// ⇒ 列上必須同時寫出<b>世界名</b>與 <b>Marketbuddy</b>,不能只是多一個價格。
+    /// <para>
+    /// 🔴 <b>年紀永遠印出來</b>,不跟著「顯示資料更新時間」那個設定走:這份資料最舊可以到
+    /// 1 小時前,沒有年紀的話使用者沒辦法判斷該不該相信它——那比不顯示更糟。
+    /// </para>
+    /// <para>
+    /// ⚠️ 刻意<b>不印筆數</b>:提供端拿到的是第一頁,「共 N 件」會是錯的。
+    /// </para>
+    /// </remarks>
+    private void AppendMarketbuddyRow(List<Payload> payloads, bool hq, MarketbuddyListings snapshot) {
+        // 查不到世界名時印 ? 而不是留白:「不知道」本身要看得見。
+        var worldName = UniversalisClientV2.WorldLookup.TryGetValue(snapshot.WorldId, out var world)
+            ? world.Name
+            : "?";
+        payloads.Add(new TextPayload("\n  Board (??, Marketbuddy)".Loc(worldName) + ": "));
+
+        if (snapshot.ConfirmedEmpty) {
+            // Marketbuddy 走完流程確認過沒人在賣——這是 Universalis 推不出來的資訊。
+            payloads.Add(new UIForegroundPayload(20));
+            payloads.Add(new TextPayload("nobody is selling this".Loc()));
+            payloads.Add(new UIForegroundPayload(0));
+        } else {
+            // 🔴 0 代表「這個品質沒有掛單」,不是免費。
+            var nqPrice = snapshot.LowestPriceNq == 0 ? (uint?)null : snapshot.LowestPriceNq;
+            var hqPrice = snapshot.LowestPriceHq == 0 ? (uint?)null : snapshot.LowestPriceHq;
+            var showNq = nqPrice != null && (plugin.Configuration.ShowBothNqAndHq || !hq);
+            var showHq = hqPrice != null && (plugin.Configuration.ShowBothNqAndHq || hq);
+
+            if (!showNq && !showHq) {
+                // 有資料,但看到的全是另一種品質。留白會被讀成「沒查到」,所以明講。
+                payloads.Add(new UIForegroundPayload(20));
+                payloads.Add(new TextPayload("no listing of this quality".Loc()));
+                payloads.Add(new UIForegroundPayload(0));
+            } else {
+                if (showNq) {
+                    if (!hq)
+                        payloads.Add(new UIForegroundPayload(506));
+                    payloads.Add(new TextPayload($"{nqPrice!.Value.ToString("N0", FormatProvider)}{GilIcon}"));
+                    if (!hq)
+                        payloads.Add(new UIForegroundPayload(0));
+                }
+
+                if (showHq) {
+                    if (showNq)
+                        payloads.Add(new TextPayload("/"));
+                    if (hq)
+                        payloads.Add(new UIForegroundPayload(506));
+                    payloads.Add(new TextPayload($"{HQIcon}{hqPrice!.Value.ToString("N0", FormatProvider)}{GilIcon}"));
+                    if (hq)
+                        payloads.Add(new UIForegroundPayload(0));
+                }
+            }
+        }
+
+        var observed = DateTimeOffset.FromUnixTimeMilliseconds(snapshot.ObservedAtUnixMs).LocalDateTime;
+        payloads.Add(new UIForegroundPayload(20));
+        payloads.Add(new TextPayload($" ({PrintDuration(DateTime.Now - observed)})"));
+        payloads.Add(new UIForegroundPayload(0));
+    }
+
     private static string PrintDuration(TimeSpan span) {
         if (span.Days > 0)
-            return $"{span.Days}d ago";
+            return "??d ago".Loc(span.Days);
         if (span.Hours > 0)
-            return $"{span.Hours}h ago";
+            return "??h ago".Loc(span.Hours);
         if (span.Minutes > 0)
-            return $"{span.Minutes}m ago";
-        return "just now";
+            return "??m ago".Loc(span.Minutes);
+        return "just now".Loc();
     }
 
     public void Dispose() {

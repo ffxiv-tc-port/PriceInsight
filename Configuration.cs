@@ -40,6 +40,15 @@ public class Configuration : IPluginConfiguration {
 
     public bool ShowBothNqAndHq { get; set; } = true;
 
+    /// <summary>
+    /// 在提示視窗裡另外列一行 Marketbuddy 看到的真實掛單(本世界、最多 1 小時)。
+    /// 預設開啟;Marketbuddy 沒裝時這個選項不會有任何效果。
+    /// </summary>
+    public bool ShowMarketbuddyListings { get; set; } = true;
+
+    /// <summary>Price unsellable items by what they can be exchanged for (e.g. inspected Skybuilders' materials).</summary>
+    public bool ShowConvertedItemPrices { get; set; } = false;
+
     [JsonExtensionData]
     public Dictionary<string, object> AdditionalData { get; set; } = new();
 
