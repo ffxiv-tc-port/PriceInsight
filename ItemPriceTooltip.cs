@@ -16,6 +16,8 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
     private const char HQIcon = '';
     private const char GilIcon = '';
     private const ushort ConversionColor = 31;
+    // Marketbuddy 板上實價那一行的標籤與符合品質的價格用淺綠,跟 Universalis 的金色價格分開。
+    private const ushort MarketbuddyColor = 43;
 
     public int? LastItemQuantity;
 
@@ -540,7 +542,11 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         var worldName = UniversalisClientV2.WorldLookup.TryGetValue(snapshot.WorldId, out var world)
             ? world.Name
             : "?";
-        payloads.Add(new TextPayload("\n  Board (??, Marketbuddy)".Loc(worldName) + ": "));
+        // 翻譯鍵含開頭的換行,不拆開;換行包進顏色區段跟上方轉換提示同做法。
+        payloads.Add(new UIForegroundPayload(MarketbuddyColor));
+        payloads.Add(new TextPayload("\n  Board (??, Marketbuddy)".Loc(worldName)));
+        payloads.Add(new UIForegroundPayload(0));
+        payloads.Add(new TextPayload(": "));
 
         if (snapshot.ConfirmedEmpty) {
             // Marketbuddy 走完流程確認過沒人在賣——這是 Universalis 推不出來的資訊。
@@ -562,7 +568,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             } else {
                 if (showNq) {
                     if (!hq)
-                        payloads.Add(new UIForegroundPayload(506));
+                        payloads.Add(new UIForegroundPayload(MarketbuddyColor));
                     payloads.Add(new TextPayload($"{nqPrice!.Value.ToString("N0", FormatProvider)}{GilIcon}"));
                     if (!hq)
                         payloads.Add(new UIForegroundPayload(0));
@@ -572,7 +578,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
                     if (showNq)
                         payloads.Add(new TextPayload("/"));
                     if (hq)
-                        payloads.Add(new UIForegroundPayload(506));
+                        payloads.Add(new UIForegroundPayload(MarketbuddyColor));
                     payloads.Add(new TextPayload($"{HQIcon}{hqPrice!.Value.ToString("N0", FormatProvider)}{GilIcon}"));
                     if (hq)
                         payloads.Add(new UIForegroundPayload(0));
