@@ -26,6 +26,11 @@ public class UniversalisClientV2 : IDisposable {
     // session-scoped, not persisted: a reload re-probes, so a transient outage cannot write off a real world.
     private static readonly ConcurrentDictionary<uint, byte> UnrecognizedWorldIds = new();
 
+    // World IDs in aggregated responses that are not in the World sheet; only throttles the log line.
+    // Capped because a misbehaving response can carry a fresh garbage ID every time.
+    private static readonly ConcurrentDictionary<uint, byte> UnknownResponseWorldIds = new();
+    private const int UnknownResponseWorldIdLogCap = 20;
+
     // Universalis resets keep-alive connections that sat idle for well under .NET's 60 s default, and a
     // request sent on one fails at once. Retiring idle connections first costs one extra TLS handshake.
     private static readonly TimeSpan PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15);
@@ -85,6 +90,12 @@ public class UniversalisClientV2 : IDisposable {
 
     private async Task<Dictionary<uint, MarketBoardData>?> GetMarketBoardDataListOnce(
         uint homeWorldId, ICollection<uint> itemId, CancellationToken cancellationToken) {
+        // Checked once up front so no per-item conversion can throw on it and sink the batch.
+        if (!WorldLookup.TryGetValue(homeWorldId, out var homeWorld)) {
+            Service.PluginLog.Error("Home worldId {0} is not in the World sheet; skipping the Universalis lookup.", homeWorldId);
+            return null;
+        }
+
         using var result =
             await httpClient.GetAsync($"https://universalis.app/api/v2/aggregated/{homeWorldId}/{string.Join(',', itemId.Select(i => i.ToString()))}",
                 cancellationToken);
@@ -108,7 +119,7 @@ public class UniversalisClientV2 : IDisposable {
                 foreach (var item in json.results) {
                     // Indexer rather than Add(): a duplicated itemId in the response would otherwise
                     // throw and lose the whole batch.
-                    items[item.itemId] = item.ToMarketBoardData(homeWorldId);
+                    items[item.itemId] = item.ToMarketBoardData(homeWorldId, homeWorld);
                 }
             }
 
@@ -259,6 +270,15 @@ public class UniversalisClientV2 : IDisposable {
             else
                 Service.PluginLog.Information("Universalis connection dropped ({0}) for {1}, retrying once.", DescribeDrop(ex), requestUri);
         }, cancellationToken);
+
+    internal static void ReportUnknownResponseWorld(uint worldId, int price) {
+        if (UnknownResponseWorldIds.Count >= UnknownResponseWorldIdLogCap || !UnknownResponseWorldIds.TryAdd(worldId, 0))
+            return;
+        var last = UnknownResponseWorldIds.Count >= UnknownResponseWorldIdLogCap;
+        Service.PluginLog.Information(
+            "Universalis returned unknown worldId {0} (price {1}) in aggregated data; ignoring that entry.{2}",
+            worldId, price, last ? " Further unknown worldIds are not logged this session." : "");
+    }
 
     private static string DescribeDrop(Exception ex) {
         var root = ex.GetBaseException();
@@ -466,8 +486,8 @@ file class Result {
     public Aggregate? hq { get; set; }
     public List<WorldUploadTime>? worldUploadTimes { get; set; }
 
-    public MarketBoardData ToMarketBoardData(uint worldId) {
-        var (worldName, dcName, region) = UniversalisClientV2.WorldLookup[worldId];
+    public MarketBoardData ToMarketBoardData(uint worldId, (string Name, string DcName, string Region) homeWorld) {
+        var (worldName, dcName, region) = homeWorld;
         var worldUploadTimes = this.worldUploadTimes != null
             ? this.worldUploadTimes.ToDictionary(w => w.worldId, w => (DateTime)w.timestamp)
             : new Dictionary<uint, DateTime>();
@@ -561,7 +581,13 @@ file class Entry {
             return null;
         string? world = null, datacenter = null;
         if (e.worldId != null) {
-            (world, datacenter, _) = UniversalisClientV2.WorldLookup[e.worldId.Value];
+            // An unknown world drops the whole entry, price included: if the fields are shifted the
+            // price is suspect too. Other entries and items in the batch are unaffected.
+            if (!UniversalisClientV2.WorldLookup.TryGetValue(e.worldId.Value, out var known)) {
+                UniversalisClientV2.ReportUnknownResponseWorld(e.worldId.Value, e.price.Value);
+                return null;
+            }
+            (world, datacenter, _) = known;
         }
 
         return new Listing { Price = e.price.Value, Time = e.timestamp, World = world, Datacenter = datacenter };
