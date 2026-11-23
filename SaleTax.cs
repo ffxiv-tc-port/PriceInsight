@@ -3,7 +3,8 @@ using System;
 namespace PriceInsight;
 
 /// <summary>
-/// 寄售稅：成交後賣方實拿＝成交總額×(100−稅率)/100,整數無條件捨去。
+/// 寄售稅：照遊戲的算法,稅額＝成交總額×稅率/100 先捨去,賣方實拿＝總額−稅額
+/// (例:2,399 gil、5% ⇒ 稅 119、實拿 2,280;不是 2,399×95/100 捨去的 2,279)。
 /// 稅率依僱員所在城市每週變動、上限 5%;提示視窗不知道會由哪位僱員賣,
 /// 所以有遊戲送來的稅率時取各城最高(估出來只會偏少),沒有就用 5%。
 /// </summary>
@@ -40,5 +41,5 @@ public sealed class SaleTax {
     }
 
     public static long NetProceeds(long gross, int percent) =>
-        gross <= 0 ? 0 : gross * (100 - Math.Clamp(percent, 0, 100)) / 100;
+        gross <= 0 ? 0 : gross - gross * Math.Clamp(percent, 0, 100) / 100;
 }
