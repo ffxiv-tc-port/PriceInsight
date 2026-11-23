@@ -49,6 +49,9 @@ public class Configuration : IPluginConfiguration {
     /// <summary>Price unsellable items by what they can be exchanged for (e.g. inspected Skybuilders' materials).</summary>
     public bool ShowConvertedItemPrices { get; set; } = false;
 
+    /// <summary>本服最低價扣掉寄售稅後大約拿多少(稅率取不到即時值時用 5%)。</summary>
+    public bool ShowAfterTaxEstimate { get; set; } = true;
+
     [JsonExtensionData]
     public Dictionary<string, object> AdditionalData { get; set; } = new();
 

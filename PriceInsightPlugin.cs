@@ -21,6 +21,8 @@ public class PriceInsightPlugin : IDalamudPlugin {
 
     public ItemConversions ItemConversions { get; } = new();
 
+    public SaleTax SaleTax { get; } = new();
+
     private readonly ConfigUI configUi;
 
     public PriceInsightPlugin(IDalamudPluginInterface pluginInterface) {
@@ -50,6 +52,18 @@ public class PriceInsightPlugin : IDalamudPlugin {
         Service.ClientState.Login += ClientOnLogin;
         Service.MarketBoard.OfferingsReceived += MarketBoardOnOfferingsReceived;
         Service.MarketBoard.HistoryReceived += MarketBoardOnHistoryReceived;
+        Service.MarketBoard.TaxRatesReceived += MarketBoardOnTaxRatesReceived;
+    }
+
+    private void MarketBoardOnTaxRatesReceived(IMarketTaxRates rates) {
+        try {
+            uint[] towns = [rates.LimsaLominsaTax, rates.GridaniaTax, rates.UldahTax, rates.IshgardTax,
+                rates.KuganeTax, rates.CrystariumTax, rates.SharlayanTax, rates.TuliyollalTax];
+            var accepted = SaleTax.Accept(towns, rates.ValidUntil, DateTime.UtcNow);
+            Service.PluginLog.Information($"[PriceInsight] 收到市場稅率 {string.Join('/', towns)}%（有效到 {rates.ValidUntil:u}）：{(accepted ? "提示視窗的稅後估算改用各城最高值" : "數值不合理，不採用，維持 5%")}");
+        } catch (Exception e) {
+            Service.PluginLog.Error(e, "Failed to apply market tax rates");
+        }
     }
 
     private void MarketBoardOnOfferingsReceived(IMarketBoardCurrentOfferings currentOfferings) {
@@ -145,6 +159,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
         Service.ClientState.Login -= ClientOnLogin;
         Service.MarketBoard.OfferingsReceived -= MarketBoardOnOfferingsReceived;
         Service.MarketBoard.HistoryReceived -= MarketBoardOnHistoryReceived;
+        Service.MarketBoard.TaxRatesReceived -= MarketBoardOnTaxRatesReceived;
         Hooks.Dispose();
         ItemPriceTooltip.Dispose();
         ItemPriceLookup.Dispose();

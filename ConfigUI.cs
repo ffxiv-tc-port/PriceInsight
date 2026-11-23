@@ -151,6 +151,14 @@ internal class ConfigUI(PriceInsightPlugin plugin) : IDisposable {
                     "Marketbuddy passively remembers the real listings it has seen on the market board for the world you are on (up to 1 hour).\nThose are real, world-local prices; Universalis is crowd-uploaded and can be days old.\nHas no effect when Marketbuddy is not installed."
                         .Loc());
 
+            configValue = conf.ShowAfterTaxEstimate;
+            if (ImGui.Checkbox("Show after-tax proceeds".Loc(), ref configValue)) {
+                conf.ShowAfterTaxEstimate = configValue;
+                conf.Save();
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Adds a line with your home world's lowest listing and roughly how much you would receive after the market tax.\nYou can only sell on your own world. Uses the highest city tax the game last told you, otherwise 5%.".Loc());
+
             configValue = conf.ShowBothNqAndHq;
             if (ImGui.Checkbox("Always display NQ and HQ prices".Loc(), ref configValue)) {
                 conf.ShowBothNqAndHq = configValue;

@@ -18,6 +18,10 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
     private const ushort ConversionColor = 31;
     // Marketbuddy 板上實價那一行的標籤與符合品質的價格用淺綠,跟 Universalis 的金色價格分開。
     private const ushort MarketbuddyColor = 43;
+    // ItemDetail.uld 的道具說明文字節點;價格行字級抄它,讀不到就用下面兩個建立時的原值。
+    private const uint DescriptionNodeId = 42;
+    private const byte DefaultFontSize = 12;
+    private const byte DefaultLineSpacing = 18;
 
     public int? LastItemQuantity;
 
@@ -142,8 +146,8 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             priceNode->AtkResNode.Color = baseNode->AtkResNode.Color;
             priceNode->TextColor = baseNode->TextColor;
             priceNode->EdgeColor = baseNode->EdgeColor;
-            priceNode->LineSpacing = 18;
-            priceNode->FontSize = 12;
+            priceNode->LineSpacing = DefaultLineSpacing;
+            priceNode->FontSize = DefaultFontSize;
             priceNode->TextFlags = baseNode->TextFlags | TextFlags.MultiLine | TextFlags.AutoAdjustNodeSize;
             var prev = insertNode->PrevSiblingNode;
             priceNode->AtkResNode.ParentNode = insertNode->ParentNode;
@@ -155,6 +159,7 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             itemTooltip->UldManager.UpdateDrawNodeList();
         }
 
+        MatchDescriptionFont(itemTooltip, priceNode);
         priceNode->AtkResNode.ToggleVisibility(true);
         priceNode->SetText(new SeString(payloads).Encode());
         priceNode->ResizeNodeForCurrentText();
@@ -173,6 +178,21 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         }
 
         insertNode->SetYFloat(insertNode->Y + priceNode->AtkResNode.Height + 4);
+    }
+
+    // 只讀說明節點、只寫自己建的節點;說明節點不在或字級不合理時維持原本的 12／18。
+    private static unsafe void MatchDescriptionFont(AtkUnitBase* itemTooltip, AtkTextNode* priceNode) {
+        var description = itemTooltip->GetTextNodeById(DescriptionNodeId);
+        var (size, spacing) = FontFor(description == null ? (byte)0 : description->FontSize);
+        priceNode->FontSize = size;
+        priceNode->LineSpacing = spacing;
+    }
+
+    internal static (byte Size, byte Spacing) FontFor(byte descriptionSize) {
+        if (descriptionSize is < 8 or > 32)
+            return (DefaultFontSize, DefaultLineSpacing);
+        // 行距照原本 12:18 的比例跟著放大縮小。
+        return (descriptionSize, (byte)Math.Round(DefaultLineSpacing * descriptionSize / (double)DefaultFontSize));
     }
 
     private List<Payload> ParseMbData(ulong fullItemId, bool hq, MarketBoardData? mbData, LookupState lookupState, ItemConversion? conversion) {
@@ -325,6 +345,15 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
             if (liveBoard != null) {
                 PriceHeader();
                 AppendMarketbuddyRow(payloads, hq, liveBoard);
+            }
+
+            // 只能在自己的世界上架 ⇒ 用本服最低價,且只看滑鼠所指的品質(拿 NQ 價估 HQ 會誤導)。
+            if (plugin.Configuration.ShowAfterTaxEstimate) {
+                var homeLowest = hq ? mbData.MinimumPrice.World.Hq?.Price : mbData.MinimumPrice.World.Nq?.Price;
+                if (homeLowest is > 0) {
+                    PriceHeader();
+                    AppendAfterTaxRow(payloads, hq, homeLowest.Value, stackQuantity);
+                }
             }
 
             var recentHeader = false;
@@ -590,6 +619,16 @@ public class ItemPriceTooltip(PriceInsightPlugin plugin) : IDisposable {
         payloads.Add(new UIForegroundPayload(20));
         payloads.Add(new TextPayload($" ({PrintDuration(DateTime.Now - observed)})"));
         payloads.Add(new UIForegroundPayload(0));
+    }
+
+    /// <summary>「本服最低價 → 扣稅後約拿多少」。整組數字照「顯示整組出售價格」的開關另外附上。</summary>
+    private void AppendAfterTaxRow(List<Payload> payloads, bool hq, long unitPrice, int? stackQuantity) {
+        var (percent, _) = plugin.SaleTax.Current(DateTime.UtcNow);
+        var price = $"{(hq ? HQIcon.ToString() : "")}{unitPrice.ToString("N0", FormatProvider)}{GilIcon}";
+        var net = $"{SaleTax.NetProceeds(unitPrice, percent).ToString("N0", FormatProvider)}{GilIcon}";
+        if (plugin.Configuration.ShowStackSalePrice && stackQuantity > 1)
+            net += $" ({SaleTax.NetProceeds(unitPrice * stackQuantity.Value, percent).ToString("N0", FormatProvider)}{GilIcon})";
+        payloads.Add(new TextPayload("\n  Home lowest ?? → after tax about ?? (??% tax)".Loc(price, net, percent)));
     }
 
     private static string PrintDuration(TimeSpan span) {
