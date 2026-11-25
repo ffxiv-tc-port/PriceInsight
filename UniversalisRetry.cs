@@ -23,12 +23,20 @@ internal static class UniversalisRetry {
         statusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests or >= HttpStatusCode.InternalServerError;
 
     /// <summary>
+    /// The response outgrew the client's <see cref="HttpClient.MaxResponseContentBufferSize"/> (decompressed
+    /// size). It carries no StatusCode, so it must be graded before anything that reads "no status" as a
+    /// network failure; sending the same GET again would only download the same oversized body.
+    /// </summary>
+    public static bool IsResponseTooLarge(HttpRequestException ex) =>
+        ex.HttpRequestError == HttpRequestError.ConfigurationLimitExceeded;
+
+    /// <summary>
     /// No HTTP status and an I/O or socket failure underneath: the connection was reset or cut, typically
     /// a pooled keep-alive connection the server had already closed. Every Universalis call is a GET, so
     /// sending it again on a fresh connection is safe.
     /// </summary>
     public static bool IsConnectionDropped(HttpRequestException ex) {
-        if (ex.StatusCode != null)
+        if (ex.StatusCode != null || IsResponseTooLarge(ex))
             return false;
         for (var inner = ex.InnerException; inner != null; inner = inner.InnerException) {
             if (inner is IOException or SocketException)

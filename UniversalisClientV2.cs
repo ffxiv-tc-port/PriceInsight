@@ -98,6 +98,10 @@ public class UniversalisClientV2 : IDisposable {
             // Expected cancellation (alt-refresh, logout cache clear, plugin unload) - not an error.
             Service.PluginLog.Verbose("Universalis lookup for itemIds {0} was cancelled.", itemId);
             return null;
+        } catch (HttpRequestException ex) when (UniversalisRetry.IsResponseTooLarge(ex)) {
+            // Not a connection or server-load problem, so the circuit breaker is left alone.
+            ReportResponseTooLarge("itemIds", itemId);
+            return null;
         } catch (HttpRequestException ex) when (UniversalisRetry.IsTransient(ex.StatusCode)) {
             // Still transient after the retry: server-side/rate-limit issue, not something the user can act on.
             Service.PluginLog.Warning("Universalis is having issues (HTTP {0}) while fetching itemIds {1}.", ex.StatusCode, itemId);
@@ -175,6 +179,9 @@ public class UniversalisClientV2 : IDisposable {
                         var data = await GetMarketBoardOverview(homeWorldId, unresolvedItem, cancellationToken);
                         breaker.RecordSuccess();
                         return (ItemId: unresolvedItem, Data: data, Error: (Exception?)null);
+                    } catch (HttpRequestException ex) when (UniversalisRetry.IsResponseTooLarge(ex)) {
+                        ReportResponseTooLarge("overview itemId", unresolvedItem);
+                        return (ItemId: unresolvedItem, Data: (MarketBoardData?)null, Error: (Exception?)null);
                     } catch (Exception ex) when (!cancellationToken.IsCancellationRequested) {
                         // One item failing must not sink the rest of the batch; the user can re-hover to retry.
                         RecordFailure();
@@ -320,6 +327,13 @@ public class UniversalisClientV2 : IDisposable {
         Service.PluginLog.Information(
             "Universalis returned unknown worldId {0} (price {1}) in aggregated data; ignoring that entry.{2}",
             worldId, price, last ? " Further unknown worldIds are not logged this session." : "");
+    }
+
+    /// <summary>Counts toward the hourly failure total but never toward the circuit breaker.</summary>
+    private void ReportResponseTooLarge(string what, object ids) {
+        stats.Failure();
+        Service.PluginLog.Warning("Universalis response exceeded the {0} MB limit for {1} {2}; discarded, not retried.",
+            MaxResponseBytes / (1024 * 1024), what, ids);
     }
 
     private static string DescribeDrop(Exception ex) {
