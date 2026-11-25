@@ -11,16 +11,26 @@ using Lumina.Excel.Sheets;
 
 namespace PriceInsight;
 
+/// <remarks>
+/// One instance per login session. The per-world <see cref="WorldPriceStore"/> outlives it, so a relog
+/// (AutoRetainer cycles characters several times an hour) keeps the prices already fetched.
+/// </remarks>
 public class ItemPriceLookup : IDisposable {
-    private readonly InMemoryCaching cache = new("prices", new InMemoryCachingOptions { EnableReadDeepClone = false });
+    /// <summary>Everything that is only valid for one world; kept by <see cref="PriceInsightPlugin"/> across logouts.</summary>
+    internal sealed class WorldPriceStore(uint worldId) {
+        public uint WorldId { get; } = worldId;
+        public readonly InMemoryCaching Cache = new("prices", new InMemoryCachingOptions { EnableReadDeepClone = false });
+        // Live data seen on the in-game market board for this world - fresher than anything Universalis has.
+        public readonly ConcurrentDictionary<uint, LiveWorldData> LiveWorldData = new();
+        // When each cached entry was last written (Universalis fetch, live board merge or synthesis).
+        public readonly ConcurrentDictionary<uint, DateTime> LastUpdated = new();
+        public readonly ItemFailureCooldown Failures = new();
+    }
+
     private readonly ConcurrentQueue<uint> requestedItems = new();
     private readonly ConcurrentDictionary<uint, (Task Task, CancellationTokenSource Token)> activeTasks = new();
-    // Live data seen on the in-game market board for the tracked world - fresher than anything Universalis has.
-    private readonly ConcurrentDictionary<uint, LiveWorldData> liveWorldData = new();
     // Items whose cached entry is still shown while a forced (alt) refresh is in flight.
     private readonly ConcurrentDictionary<uint, byte> refreshingItems = new();
-    // When each cached entry was last written (Universalis fetch, live board merge or synthesis).
-    private readonly ConcurrentDictionary<uint, DateTime> lastUpdated = new();
     // An entry younger than this is not worth re-fetching on a forced refresh.
     private static readonly TimeSpan FreshnessWindow = TimeSpan.FromMinutes(10);
     // A resolved entry that actually carries prices is cached long; a resolved-but-empty one
@@ -30,9 +40,13 @@ public class ItemPriceLookup : IDisposable {
     private static readonly TimeSpan EmptyCacheDuration = TimeSpan.FromMinutes(10);
     private readonly PriceInsightPlugin plugin;
     private readonly CancellationTokenSource cancellationTokenSource = new();
-    private uint? homeWorldId;
+    // Picked once per session by the first CheckReady and never swapped: moving to another world
+    // mid-session keeps querying the world picked at login.
+    private volatile WorldPriceStore? store;
+    // Framework thread only; counts one cache hit / cooldown skip per hovered item, not per tooltip update.
+    private ulong lastCountedHoverItem;
 
-    private sealed record LiveWorldData {
+    internal sealed record LiveWorldData {
         public DateTime OfferingsSeen { get; init; }
         public Listing? MinNq { get; init; }
         public Listing? MinHq { get; init; }
@@ -49,49 +63,76 @@ public class ItemPriceLookup : IDisposable {
     }
 
     public bool CheckReady() {
+        if (store != null)
+            return true;
         var localPlayer = Service.ObjectTable.LocalPlayer;
         if (localPlayer == null) return false;
-        if (plugin.Configuration.UseCurrentWorld) {
-            homeWorldId ??= localPlayer.CurrentWorld.RowId;
-        } else {
-            homeWorldId ??= localPlayer.HomeWorld.RowId;
-        }
-
-        return homeWorldId != null;
+        var worldId = plugin.Configuration.UseCurrentWorld ? localPlayer.CurrentWorld.RowId : localPlayer.HomeWorld.RowId;
+        store = plugin.WorldStores.GetOrCreate(worldId, out var evicted);
+        if (evicted != null)
+            Service.PluginLog.Debug($"Price cache: dropped world {evicted}, keeping at most {PriceInsightPlugin.KeptWorlds} worlds");
+        return true;
     }
 
     public (MarketBoardData? MarketBoardData, LookupState State) Get(ulong fullItemId, bool refresh) {
         if (!ToMarketableItemId(fullItemId, out var itemId))
             return (null, LookupState.NonMarketable);
+        // A hover before anything else resolved the world (plugin loaded mid-session) used to send a
+        // lookup without a world and fail; resolve it here instead.
+        if (!CheckReady() || store is not { } s)
+            return (null, LookupState.Faulted);
 
-        var cached = cache.Get<MarketBoardData>(itemId.ToString()) is { IsNull: false, Value: var mbData } ? mbData : null;
+        var now = DateTime.Now;
+        var suspended = plugin.UniversalisClientV2.IsSuspended(now);
+        var cached = s.Cache.Get<MarketBoardData>(itemId.ToString()) is { IsNull: false, Value: var mbData } ? mbData : null;
         if (refresh && cached != null) {
             // Freshness guard: an entry fetched/merged moments ago has nothing to gain from a re-fetch.
-            if (lastUpdated.TryGetValue(itemId, out var updated) && DateTime.Now - updated < FreshnessWindow)
+            if (s.LastUpdated.TryGetValue(itemId, out var updated) && now - updated < FreshnessWindow)
                 return (cached, LookupState.Marketable);
+            if (suspended)
+                return (cached, LookupState.Faulted);
             // Keep showing the old entry while the refresh lookup runs; it gets swapped out once
             // the fetch completes. Don't cancel an in-flight fetch - its result is fresh enough.
             refreshingItems[itemId] = 0;
             if (!activeTasks.ContainsKey(itemId) && !requestedItems.Contains(itemId))
-                requestedItems.Enqueue(itemId);
+                Enqueue(itemId, FetchSource.Hover);
             return (cached, LookupState.Refreshing);
         }
 
-        if (cached != null)
+        var newHover = lastCountedHoverItem != fullItemId;
+        lastCountedHoverItem = fullItemId;
+        if (cached != null) {
+            if (newHover)
+                plugin.Stats.HoverCacheHit();
             return (cached, refreshingItems.ContainsKey(itemId) ? LookupState.Refreshing : LookupState.Marketable);
+        }
         if (activeTasks.TryGetValue(itemId, out var t))
             return (null, t.Task.IsFaulted ? LookupState.Faulted : LookupState.Marketable);
+        // Alt skips the per-item cooldown (the user asked explicitly) but not the circuit breaker.
+        if (suspended)
+            return (null, LookupState.Faulted);
+        if (!refresh && s.Failures.IsCoolingDown(itemId, now)) {
+            if (newHover)
+                plugin.Stats.CooldownSkip();
+            return (null, LookupState.Faulted);
+        }
 
-        requestedItems.Enqueue(itemId);
+        if (!requestedItems.Contains(itemId))
+            Enqueue(itemId, FetchSource.Hover);
 
         return (null, LookupState.Marketable);
     }
 
+    private void Enqueue(uint itemId, FetchSource source) {
+        requestedItems.Enqueue(itemId);
+        plugin.Stats.Queued(source, 1);
+    }
+
     // Cache peek without lookup side effects (no enqueue, no state changes).
     public MarketBoardData? GetCached(ulong fullItemId) {
-        if (!ToMarketableItemId(fullItemId, out var itemId))
+        if (!ToMarketableItemId(fullItemId, out var itemId) || store is not { } s)
             return null;
-        return cache.Get<MarketBoardData>(itemId.ToString()) is { IsNull: false, Value: var mbData } ? mbData : null;
+        return s.Cache.Get<MarketBoardData>(itemId.ToString()) is { IsNull: false, Value: var mbData } ? mbData : null;
     }
 
     private static bool ToMarketableItemId(ulong fullItemId, out uint itemId, ExcelSheet<Item>? sheet = null) {
@@ -102,27 +143,59 @@ public class ItemPriceLookup : IDisposable {
         return sheet.GetRowOrDefault(itemId) is not null and not { ItemSearchCategory.RowId: 0 };
     }
 
-    public void Fetch(IEnumerable<uint> items) {
+    internal void Fetch(IEnumerable<uint> items, FetchSource source) {
+        if (store is not { } s)
+            return;
+        var now = DateTime.Now;
+        if (plugin.UniversalisClientV2.IsSuspended(now))
+            return;
         var itemSheet = Service.DataManager.Excel.GetSheet<Item>();
+        var queued = 0;
         foreach (var id in items) {
             if (!ToMarketableItemId(id, out var itemId, itemSheet))
                 continue;
-            if (cache.Get(itemId.ToString()) != null || (activeTasks.TryGetValue(itemId, out var t) && !t.Task.IsFaulted))
+            if (s.Cache.Get(itemId.ToString()) != null) {
+                plugin.Stats.PrefetchCacheHit();
                 continue;
-            if (!requestedItems.Contains(itemId))
+            }
+            if (activeTasks.TryGetValue(itemId, out var t) && !t.Task.IsFaulted)
+                continue;
+            if (s.Failures.IsCoolingDown(itemId, now)) {
+                plugin.Stats.CooldownSkip();
+                continue;
+            }
+            if (!requestedItems.Contains(itemId)) {
                 requestedItems.Enqueue(itemId);
+                queued++;
+            }
         }
+
+        if (queued > 0)
+            plugin.Stats.Queued(source, queued);
     }
 
     private async Task ProcessQueue() {
         var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(200));
         while (await timer.WaitForNextTickAsync(cancellationTokenSource.Token)) {
-            if (requestedItems.IsEmpty)
-                continue;
-            var items = new HashSet<uint>();
-            while (items.Count < 50 && requestedItems.TryDequeue(out var item))
-                items.Add(item);
-            await FetchInternal(items);
+            try {
+                if (plugin.Stats.TryFlush(DateTime.Now) is { } summary)
+                    Service.PluginLog.Information(summary);
+                if (requestedItems.IsEmpty)
+                    continue;
+                var items = new HashSet<uint>();
+                while (items.Count < 50 && requestedItems.TryDequeue(out var item))
+                    items.Add(item);
+                if (plugin.UniversalisClientV2.IsSuspended(DateTime.Now)) {
+                    // Dropped, not marked as failed: nothing was asked, so the per-item cooldown must not start.
+                    plugin.ItemPriceTooltip.FetchFailed(items);
+                    continue;
+                }
+                await FetchInternal(items);
+            } catch (OperationCanceledException) when (cancellationTokenSource.IsCancellationRequested) {
+                break;
+            } catch (Exception e) {
+                Service.PluginLog.Error(e, "Price lookup queue iteration failed");
+            }
         }
 
         timer.Dispose();
@@ -132,11 +205,11 @@ public class ItemPriceLookup : IDisposable {
     // The board only ever shows listings of the world the player is on, so only accept them
     // when that world is the one this cache is tracking.
     private bool IsTrackedWorldCurrent() {
-        return CheckReady() && Service.PlayerState.IsLoaded && Service.PlayerState.CurrentWorld.RowId == homeWorldId;
+        return CheckReady() && Service.PlayerState.IsLoaded && Service.PlayerState.CurrentWorld.RowId == store?.WorldId;
     }
 
     public void ApplyMarketBoardOfferings(IMarketBoardCurrentOfferings currentOfferings) {
-        if (!IsTrackedWorldCurrent())
+        if (!IsTrackedWorldCurrent() || store is not { } s)
             return;
         var now = DateTime.Now;
         foreach (var listings in currentOfferings.ItemListings.GroupBy(l => l.ItemId)) {
@@ -150,7 +223,7 @@ public class ItemPriceLookup : IDisposable {
             }
 
             var itemId = listings.Key;
-            liveWorldData.AddOrUpdate(itemId,
+            s.LiveWorldData.AddOrUpdate(itemId,
                 _ => new LiveWorldData { OfferingsSeen = now, MinNq = minNq, MinHq = minHq },
                 (_, old) => {
                     // Pages of the same browse arrive within seconds - combine them; a later browse replaces.
@@ -161,12 +234,12 @@ public class ItemPriceLookup : IDisposable {
 
                     return old with { OfferingsSeen = now, MinNq = minNq, MinHq = minHq };
                 });
-            ApplyLiveDataToCachedEntry(itemId);
+            ApplyLiveDataToCachedEntry(s, itemId);
         }
     }
 
     public void ApplyMarketBoardHistory(IMarketBoardHistory history) {
-        if (!IsTrackedWorldCurrent())
+        if (!IsTrackedWorldCurrent() || store is not { } s)
             return;
         Listing? recentNq = null, recentHq = null;
         foreach (var l in history.HistoryListings) {
@@ -180,30 +253,30 @@ public class ItemPriceLookup : IDisposable {
         if (recentNq == null && recentHq == null)
             return;
         var now = DateTime.Now;
-        liveWorldData.AddOrUpdate(history.ItemId,
+        s.LiveWorldData.AddOrUpdate(history.ItemId,
             _ => new LiveWorldData { HistorySeen = now, RecentNq = recentNq, RecentHq = recentHq },
             (_, old) => old with { HistorySeen = now, RecentNq = recentNq ?? old.RecentNq, RecentHq = recentHq ?? old.RecentHq });
-        ApplyLiveDataToCachedEntry(history.ItemId);
+        ApplyLiveDataToCachedEntry(s, history.ItemId);
     }
 
     private static Listing? Cheapest(Listing? a, Listing? b) => a == null ? b : b == null ? a : b.Price < a.Price ? b : a;
 
     private static Listing? MostRecent(Listing? a, Listing? b) => a == null ? b : b == null ? a : b.Time > a.Time ? b : a;
 
-    private void ApplyLiveDataToCachedEntry(uint itemId) {
-        if (cache.Get<MarketBoardData>(itemId.ToString()) is not { IsNull: false, Value: var mbData })
+    private static void ApplyLiveDataToCachedEntry(WorldPriceStore s, uint itemId) {
+        if (s.Cache.Get<MarketBoardData>(itemId.ToString()) is not { IsNull: false, Value: var mbData })
             return;
-        var merged = MergeLiveWorldData(itemId, mbData);
+        var merged = MergeLiveWorldData(s, itemId, mbData);
         if (!ReferenceEquals(merged, mbData)) {
-            cache.Set(itemId.ToString(), merged, TimeSpan.FromMinutes(90));
-            lastUpdated[itemId] = DateTime.Now;
+            s.Cache.Set(itemId.ToString(), merged, TimeSpan.FromMinutes(90));
+            s.LastUpdated[itemId] = DateTime.Now;
         }
     }
 
     // Overlay data the player just saw on the market board over the (often much older) Universalis
     // own-world data. Cross-world/datacenter scopes stay untouched - the board can't see those.
-    private MarketBoardData MergeLiveWorldData(uint itemId, MarketBoardData data) {
-        if (!liveWorldData.TryGetValue(itemId, out var live))
+    private static MarketBoardData MergeLiveWorldData(WorldPriceStore s, uint itemId, MarketBoardData data) {
+        if (!s.LiveWorldData.TryGetValue(itemId, out var live))
             return data;
         var result = data;
         var universalisMinTime = MostRecent(result.MinimumPrice.World.Nq, result.MinimumPrice.World.Hq)?.Time ?? DateTime.MinValue;
@@ -235,12 +308,12 @@ public class ItemPriceLookup : IDisposable {
 
     // When Universalis has nothing for an item (failed lookup or no data uploaded - common on TC)
     // but the player has seen it on the market board, build an own-world-only entry from that.
-    private MarketBoardData? SynthesizeFromLiveData(uint itemId) {
-        if (!homeWorldId.HasValue || !liveWorldData.TryGetValue(itemId, out var live))
+    private static MarketBoardData? SynthesizeFromLiveData(WorldPriceStore s, uint itemId) {
+        if (!s.LiveWorldData.TryGetValue(itemId, out var live))
             return null;
         if (live is { MinNq: null, MinHq: null, RecentNq: null, RecentHq: null })
             return null;
-        var (worldName, dcName, region) = UniversalisClientV2.WorldLookup[homeWorldId.Value];
+        var (worldName, dcName, region) = UniversalisClientV2.WorldLookup[s.WorldId];
         var empty = new Quality<Listing> { Nq = null, Hq = null };
         var emptyValue = new Quality<double?> { Nq = null, Hq = null };
         return new MarketBoardData {
@@ -256,19 +329,26 @@ public class ItemPriceLookup : IDisposable {
 
     private Task<Dictionary<uint, MarketBoardData>?> FetchInternal(ICollection<uint> itemIds) {
         var token = CancellationTokenSource.CreateLinkedTokenSource(cancellationTokenSource.Token);
+        // Captured once so a batch can only ever write into the world it was asked for.
+        var s = store;
         var itemTask = FetchItemTask();
 
         foreach (var id in itemIds) {
             var task = Task.Run(async () => {
                 var items = await itemTask;
-                if (items != null && items.TryGetValue(id, out var value)) {
-                    var duration = value.HasAnyData() ? SuccessfulCacheDuration : EmptyCacheDuration;
-                    cache.Set(id.ToString(), value, duration);
-                    lastUpdated[id] = DateTime.Now;
-                } else if (SynthesizeFromLiveData(id) is { } fromGameData) {
-                    // Shorter lifetime so Universalis still gets retried for the cross-world scopes.
-                    cache.Set(id.ToString(), fromGameData, TimeSpan.FromMinutes(15));
-                    lastUpdated[id] = DateTime.Now;
+                if (s != null) {
+                    if (items != null && items.TryGetValue(id, out var value)) {
+                        var duration = value.HasAnyData() ? SuccessfulCacheDuration : EmptyCacheDuration;
+                        s.Cache.Set(id.ToString(), value, duration);
+                        s.LastUpdated[id] = DateTime.Now;
+                        s.Failures.Clear(id);
+                    } else if (SynthesizeFromLiveData(s, id) is { } fromGameData) {
+                        // Shorter lifetime so Universalis still gets retried for the cross-world scopes.
+                        s.Cache.Set(id.ToString(), fromGameData, TimeSpan.FromMinutes(15));
+                        s.LastUpdated[id] = DateTime.Now;
+                    } else if (!token.Token.IsCancellationRequested) {
+                        s.Failures.MarkFailed(id, DateTime.Now);
+                    }
                 }
 
                 activeTasks.TryRemove(id, out _);
@@ -281,15 +361,15 @@ public class ItemPriceLookup : IDisposable {
         return itemTask;
 
         async Task<Dictionary<uint, MarketBoardData>?> FetchItemTask() {
-            if (!homeWorldId.HasValue)
+            if (s == null)
                 return null;
             var fetchStart = DateTime.Now;
-            var result = await plugin.UniversalisClientV2.GetMarketBoardDataList(homeWorldId.Value, itemIds, token.Token);
+            var result = await plugin.UniversalisClientV2.GetMarketBoardDataList(s.WorldId, itemIds, token.Token);
             if (result != null) {
                 // Overlay fresher own-world data seen on the in-game market board before it hits the tooltip/cache.
                 foreach (var id in itemIds) {
                     if (result.TryGetValue(id, out var value))
-                        result[id] = MergeLiveWorldData(id, value);
+                        result[id] = MergeLiveWorldData(s, id, value);
                 }
 
                 plugin.ItemPriceTooltip.Refresh(result);
@@ -300,7 +380,7 @@ public class ItemPriceLookup : IDisposable {
                 // are left to the synthesis path above and must not be reported as a failure.
                 if (!token.Token.IsCancellationRequested) {
                     var unresolvedItems = itemIds
-                        .Where(id => !result.ContainsKey(id) && !liveWorldData.ContainsKey(id))
+                        .Where(id => !result.ContainsKey(id) && !s.LiveWorldData.ContainsKey(id))
                         .ToArray();
                     if (unresolvedItems.Length > 0)
                         plugin.ItemPriceTooltip.FetchFailed(unresolvedItems);

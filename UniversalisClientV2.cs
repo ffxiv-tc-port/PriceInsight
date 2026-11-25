@@ -35,23 +35,47 @@ public class UniversalisClientV2 : IDisposable {
     // request sent on one fails at once. Retiring idle connections first costs one extra TLS handshake.
     private static readonly TimeSpan PooledConnectionIdleTimeout = TimeSpan.FromSeconds(15);
 
+    // A 50-item aggregated response is well under 1 MB; anything near this is not a price list.
+    private const long MaxResponseBytes = 8 * 1024 * 1024;
+
+    // At most this many v3 overview requests in flight (aggregated batches already go one at a time),
+    // so all fleet plugins together stay under Universalis' 8 connections per IP.
+    private const int OverviewConcurrency = 2;
+    private readonly SemaphoreSlim overviewSlots = new(OverviewConcurrency, OverviewConcurrency);
+
     private readonly HappyEyeballsCallback happyEyeballsCallback;
     private readonly HttpClient httpClient;
+    private readonly UniversalisStats stats;
+    private readonly CircuitBreaker breaker = new();
 
     // Lookups that still failed after the retry because the connection dropped; reset by any lookup that completes.
     private int consecutiveDroppedConnections;
 
-    public UniversalisClientV2() {
+    internal UniversalisClientV2(UniversalisStats stats) {
+        this.stats = stats;
         happyEyeballsCallback = new HappyEyeballsCallback();
         httpClient = new HttpClient(new SocketsHttpHandler {
             AutomaticDecompression = DecompressionMethods.All, ConnectCallback = happyEyeballsCallback.ConnectCallback,
             PooledConnectionIdleTimeout = PooledConnectionIdleTimeout,
-        });
+        }) { MaxResponseContentBufferSize = MaxResponseBytes };
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd($"PriceInsight/{Assembly.GetExecutingAssembly().GetName().Version} ({Environment.OSVersion}) Dalamud/{Assembly.GetAssembly(typeof(Util))!.GetName().Version}");
+    }
+
+    /// <summary>True while the circuit breaker holds every request back after repeated failures.</summary>
+    public bool IsSuspended(DateTime now) => breaker.IsOpen(now);
+
+    private void RecordFailure() {
+        stats.Failure();
+        if (!breaker.RecordFailure(DateTime.Now))
+            return;
+        stats.BreakerOpened();
+        Service.PluginLog.Warning($"[PriceInsight] Universalis 連續 {CircuitBreaker.Threshold} 次請求失敗，暫停查價 {CircuitBreaker.OpenDuration.TotalMinutes:F0} 分鐘；已快取的價格照常顯示。");
     }
 
     public async Task<Dictionary<uint, MarketBoardData>?> GetMarketBoardDataList(
         uint homeWorldId, ICollection<uint> itemId, CancellationToken cancellationToken) {
+        if (IsSuspended(DateTime.Now))
+            return null;
         try {
             // Universalis is a public service; intermittent 408/429/5xx (esp. 504, and 429 under
             // burst load) and reset keep-alive connections are routine. Retry once.
@@ -68,6 +92,7 @@ public class UniversalisClientV2 : IDisposable {
             var previousDrops = Interlocked.Exchange(ref consecutiveDroppedConnections, 0);
             if (previousDrops > 0)
                 Service.PluginLog.Information("Universalis lookups are working again after {0} consecutive dropped-connection failure(s).", previousDrops);
+            breaker.RecordSuccess();
             return result;
         } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
             // Expected cancellation (alt-refresh, logout cache clear, plugin unload) - not an error.
@@ -76,14 +101,17 @@ public class UniversalisClientV2 : IDisposable {
         } catch (HttpRequestException ex) when (UniversalisRetry.IsTransient(ex.StatusCode)) {
             // Still transient after the retry: server-side/rate-limit issue, not something the user can act on.
             Service.PluginLog.Warning("Universalis is having issues (HTTP {0}) while fetching itemIds {1}.", ex.StatusCode, itemId);
+            RecordFailure();
             return null;
         } catch (HttpRequestException ex) when (UniversalisRetry.IsConnectionDropped(ex)) {
             // Network-level and outside the user's control; one line, the stack adds nothing.
             Service.PluginLog.Warning("Universalis connection dropped again after the retry ({0}) while fetching itemIds {1}; {2} in a row.",
                 DescribeDrop(ex), itemId, Interlocked.Increment(ref consecutiveDroppedConnections));
+            RecordFailure();
             return null;
         } catch (Exception ex) {
             Service.PluginLog.Error(ex, "Failed to retrieve data from Universalis for itemIds {0}.", itemId);
+            RecordFailure();
             return null;
         }
     }
@@ -96,6 +124,7 @@ public class UniversalisClientV2 : IDisposable {
             return null;
         }
 
+        stats.AggregatedRequest(itemId.Count);
         using var result =
             await httpClient.GetAsync($"https://universalis.app/api/v2/aggregated/{homeWorldId}/{string.Join(',', itemId.Select(i => i.ToString()))}",
                 cancellationToken);
@@ -137,14 +166,18 @@ public class UniversalisClientV2 : IDisposable {
                 unresolvedItems);
             // Keep fallback concurrency deliberately small. An inventory prefetch can contain dozens of
             // legacy dyes, and each overview request already fans out across every world in the DC, so
-            // run three items at a time rather than sequentially (slow) or all at once (rate-limited).
-            foreach (var batch in unresolvedItems.Chunk(3)) {
+            // run a couple of items at a time rather than sequentially (slow) or all at once (rate-limited).
+            foreach (var batch in unresolvedItems.Chunk(OverviewConcurrency)) {
+                if (IsSuspended(DateTime.Now))
+                    break;
                 var fallbackResults = await Task.WhenAll(batch.Select(async unresolvedItem => {
                     try {
                         var data = await GetMarketBoardOverview(homeWorldId, unresolvedItem, cancellationToken);
+                        breaker.RecordSuccess();
                         return (ItemId: unresolvedItem, Data: data, Error: (Exception?)null);
                     } catch (Exception ex) when (!cancellationToken.IsCancellationRequested) {
                         // One item failing must not sink the rest of the batch; the user can re-hover to retry.
+                        RecordFailure();
                         return (ItemId: unresolvedItem, Data: (MarketBoardData?)null, Error: ex);
                     }
                 }));
@@ -204,7 +237,7 @@ public class UniversalisClientV2 : IDisposable {
                 itemId);
             var successfulWorldIds = new List<uint>();
             var partialOverviews = new List<MarketOverview>();
-            foreach (var batch in worldIds.Chunk(3)) {
+            foreach (var batch in worldIds.Chunk(OverviewConcurrency)) {
                 var worldResults = await Task.WhenAll(batch.Select(async worldId => {
                     var response = await RequestMarketBoardOverview([worldId], itemId, cancellationToken);
                     return (WorldId: worldId, response.StatusCode, response.Overview);
@@ -263,13 +296,22 @@ public class UniversalisClientV2 : IDisposable {
     /// rate limiter. It gets the same policy as the aggregated path (retry once) rather than its own,
     /// so there is a single definition of "transient" (<see cref="UniversalisRetry"/>).
     /// </remarks>
-    private Task<HttpResponseMessage> GetOverviewWithRetry(string requestUri, CancellationToken cancellationToken) =>
-        UniversalisRetry.GetAsync(httpClient, requestUri, (statusCode, ex) => {
-            if (ex == null)
-                Service.PluginLog.Debug("Universalis overview returned {0} for {1}, retrying once.", statusCode, requestUri);
-            else
-                Service.PluginLog.Information("Universalis connection dropped ({0}) for {1}, retrying once.", DescribeDrop(ex), requestUri);
-        }, cancellationToken);
+    private async Task<HttpResponseMessage> GetOverviewWithRetry(string requestUri, CancellationToken cancellationToken) {
+        // The slot is held per request, never across a nested call, so the 404 per-world path cannot deadlock.
+        await overviewSlots.WaitAsync(cancellationToken);
+        try {
+            stats.OverviewRequest();
+            return await UniversalisRetry.GetAsync(httpClient, requestUri, (statusCode, ex) => {
+                stats.OverviewRequest();
+                if (ex == null)
+                    Service.PluginLog.Debug("Universalis overview returned {0} for {1}, retrying once.", statusCode, requestUri);
+                else
+                    Service.PluginLog.Information("Universalis connection dropped ({0}) for {1}, retrying once.", DescribeDrop(ex), requestUri);
+            }, cancellationToken);
+        } finally {
+            overviewSlots.Release();
+        }
+    }
 
     internal static void ReportUnknownResponseWorld(uint worldId, int price) {
         if (UnknownResponseWorldIds.Count >= UnknownResponseWorldIdLogCap || !UnknownResponseWorldIds.TryAdd(worldId, 0))

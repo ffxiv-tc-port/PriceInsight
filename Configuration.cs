@@ -34,6 +34,9 @@ public class Configuration : IPluginConfiguration {
 
     public bool PrefetchInventory { get; set; } = true;
 
+    /// <summary>AutoRetainer 多角色模式開著時不預先擷取（滑鼠移到道具照常查）。讀不到 AutoRetainer 時照常預取。</summary>
+    public bool SkipPrefetchDuringMultiMode { get; set; } = true;
+
     public bool ShowAge { get; set; } = true;
 
     public bool ShowDatacenterOnCrossWorlds { get; set; } = true;

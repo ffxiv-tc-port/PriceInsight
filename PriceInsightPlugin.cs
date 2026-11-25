@@ -1,10 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Reflection;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Command;
 using Dalamud.Game.Network.Structures;
 using Dalamud.Plugin;
+using Dalamud.Plugin.Ipc;
+using Dalamud.Plugin.Ipc.Exceptions;
 using FFXIVClientStructs.FFXIV.Client.Game;
 
 namespace PriceInsight;
@@ -23,6 +26,17 @@ public class PriceInsightPlugin : IDalamudPlugin {
 
     public SaleTax SaleTax { get; } = new();
 
+    /// <summary>How many worlds keep their price cache across logouts.</summary>
+    internal const int KeptWorlds = 3;
+
+    // Constructed before ItemPriceLookup: its queue thread touches both right away.
+    internal UniversalisStats Stats { get; } = new(DateTime.Now);
+    internal WorldStoreSet<ItemPriceLookup.WorldPriceStore> WorldStores { get; } = new(KeptWorlds, id => new ItemPriceLookup.WorldPriceStore(id));
+
+    // Read-only: only this one state is ever asked of AutoRetainer, nothing that changes its behaviour.
+    private readonly ICallGateSubscriber<bool> arMultiModeEnabled;
+    private bool arMultiModeErrorLogged;
+
     private readonly ConfigUI configUi;
 
     public PriceInsightPlugin(IDalamudPluginInterface pluginInterface) {
@@ -31,7 +45,8 @@ public class PriceInsightPlugin : IDalamudPlugin {
 
         Configuration = Configuration.Get(pluginInterface);
 
-        UniversalisClientV2 = new UniversalisClientV2();
+        UniversalisClientV2 = new UniversalisClientV2(Stats);
+        arMultiModeEnabled = pluginInterface.GetIpcSubscriber<bool>("AutoRetainer.GetMultiModeEnabled");
         // 🔴 必須排在 ItemPriceTooltip 之前:提示視窗一被畫就會用到它。
         //    建構子只是把 CallGate 的訂閱物件拿到手,不會去呼叫 Marketbuddy。
         MarketbuddyBridge = new MarketbuddyBridge(pluginInterface);
@@ -48,7 +63,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
 
         pluginInterface.UiBuilder.Draw += () => configUi.Draw();
         pluginInterface.UiBuilder.OpenConfigUi += OpenConfigUI;
-        Service.ClientState.Logout += ClearCache;
+        Service.ClientState.Logout += ResetSession;
         Service.ClientState.Login += ClientOnLogin;
         Service.MarketBoard.OfferingsReceived += MarketBoardOnOfferingsReceived;
         Service.MarketBoard.HistoryReceived += MarketBoardOnHistoryReceived;
@@ -83,42 +98,66 @@ public class PriceInsightPlugin : IDalamudPlugin {
     }
 
     private void ClientOnLogin() {
-        CheckInventories(InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4);
+        CheckInventories(FetchSource.Login, InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4);
     }
 
     private DateTime lastCheckInventory = DateTime.MinValue;
     private void HandleInventoryUpdate(AddonEvent type, AddonArgs args) {
         if ((DateTime.Now - lastCheckInventory).TotalMinutes < 1) return;
-        CheckInventories(InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4);
+        CheckInventories(FetchSource.Inventory, InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4);
         lastCheckInventory = DateTime.Now;
     }
 
     private DateTime lastCheckSaddlebag = DateTime.MinValue;
     private void HandleSaddlebagOpen(AddonEvent type, AddonArgs args) {
         if ((DateTime.Now - lastCheckSaddlebag).TotalSeconds < 30) return;
-        CheckInventories(InventoryType.SaddleBag1, InventoryType.SaddleBag2, InventoryType.PremiumSaddleBag1, InventoryType.PremiumSaddleBag2);
+        CheckInventories(FetchSource.Saddlebag, InventoryType.SaddleBag1, InventoryType.SaddleBag2, InventoryType.PremiumSaddleBag1, InventoryType.PremiumSaddleBag2);
         lastCheckSaddlebag = DateTime.Now;
     }
 
     private DateTime lastCheckRetainer = DateTime.MinValue;
     private void HandleRetainerOpen(AddonEvent type, AddonArgs args) {
         if ((DateTime.Now - lastCheckRetainer).TotalSeconds < 5) return;
-        CheckInventories(InventoryType.RetainerPage1, InventoryType.RetainerPage2, InventoryType.RetainerPage3, InventoryType.RetainerPage4,
+        CheckInventories(FetchSource.Retainer, InventoryType.RetainerPage1, InventoryType.RetainerPage2, InventoryType.RetainerPage3, InventoryType.RetainerPage4,
             InventoryType.RetainerPage5, InventoryType.RetainerPage6, InventoryType.RetainerPage7);
         lastCheckRetainer = DateTime.Now;
     }
 
-    public void ClearCache(int type = 0, int code = 0) {
+    /// <summary>
+    /// Ends the lookup session (in-flight lookups cancelled, world picked again on next use). Cached
+    /// prices stay in <see cref="WorldStores"/>; they are per world, so they stay correct for whoever logs in next.
+    /// </summary>
+    public void ResetSession(int type = 0, int code = 0) {
         var ipl = ItemPriceLookup;
         ItemPriceLookup = new ItemPriceLookup(this);
         ipl.Dispose();
     }
 
-    private void CheckInventories(params InventoryType[] inventoriesToScan) {
+    /// <summary>AutoRetainer multi mode on/off; null when it cannot be asked (treated as off). Framework thread only.</summary>
+    private bool? QueryAutoRetainerMultiMode() {
+        try {
+            return arMultiModeEnabled.HasFunction ? arMultiModeEnabled.InvokeFunc() : null;
+        } catch (Exception e) when (e is IpcError or TargetInvocationException or InvalidCastException) {
+            if (!arMultiModeErrorLogged) {
+                arMultiModeErrorLogged = true;
+                Service.PluginLog.Information($"[PriceInsight] 讀不到 AutoRetainer 多角色模式狀態（{e.GetType().Name}），照常預先擷取價格。");
+            }
+            return null;
+        }
+    }
+
+    private void CheckInventories(FetchSource source, params InventoryType[] inventoriesToScan) {
         if (Service.PlayerState.ContentId == 0 || !ItemPriceLookup.CheckReady())
             return;
         if (!Configuration.PrefetchInventory)
             return;
+        // Asked only when the option is on, so turning it off never touches the IPC.
+        var multiMode = Configuration.SkipPrefetchDuringMultiMode ? QueryAutoRetainerMultiMode() : null;
+        if (!PrefetchPolicy.ShouldPrefetch(Configuration.PrefetchInventory, Configuration.SkipPrefetchDuringMultiMode, multiMode)) {
+            Stats.MultiModeSkip();
+            Service.PluginLog.Debug($"Prefetch: skipped {source} (AutoRetainer multi mode)");
+            return;
+        }
         Service.PluginLog.Debug($"Prefetch: checking {inventoriesToScan.Length} inventories");
         try {
             var items = new HashSet<uint>();
@@ -142,7 +181,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
 
             if (items.Count > 0) {
                 Service.PluginLog.Debug($"Prefetch: queueing {items.Count} items");
-                ItemPriceLookup.Fetch(items);
+                ItemPriceLookup.Fetch(items, source);
             }
         } catch (Exception e) {
             Service.PluginLog.Error(e, "Failed to process update");
@@ -155,7 +194,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
 
     public void Dispose() {
         Service.CommandManager.RemoveHandler("/priceinsight");
-        Service.ClientState.Logout -= ClearCache;
+        Service.ClientState.Logout -= ResetSession;
         Service.ClientState.Login -= ClientOnLogin;
         Service.MarketBoard.OfferingsReceived -= MarketBoardOnOfferingsReceived;
         Service.MarketBoard.HistoryReceived -= MarketBoardOnHistoryReceived;
@@ -165,5 +204,7 @@ public class PriceInsightPlugin : IDalamudPlugin {
         ItemPriceLookup.Dispose();
         UniversalisClientV2.Dispose();
         configUi.Dispose();
+        if (Stats.TryFlush(DateTime.Now, force: true) is { } summary)
+            Service.PluginLog.Information(summary + "（卸載前）");
     }
 }

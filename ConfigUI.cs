@@ -36,11 +36,21 @@ internal class ConfigUI(PriceInsightPlugin plugin) : IDisposable {
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("Prefetch prices for all items in inventory, chocobo saddlebag and retainer when logging in.".Loc());
 
+            ImGui.Indent();
+            configValue = conf.SkipPrefetchDuringMultiMode;
+            if (ImGui.Checkbox("Not while AutoRetainer multi mode is on".Loc(), ref configValue)) {
+                conf.SkipPrefetchDuringMultiMode = configValue;
+                conf.Save();
+            }
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("AutoRetainer multi mode logs characters in and out many times an hour; prefetching on every one of those\nlogins mostly asks Universalis for prices nobody looks at. Hovering an item still looks up its price.\nHas no effect when AutoRetainer is not installed.".Loc());
+            ImGui.Unindent();
+
             configValue = conf.UseCurrentWorld;
             if (ImGui.Checkbox("Use current world as home world".Loc(), ref configValue)) {
                 conf.UseCurrentWorld = configValue;
                 conf.Save();
-                plugin.ClearCache();
+                plugin.ResetSession();
             }
             if (ImGui.IsItemHovered())
                 ImGui.SetTooltip("The current world you're on will be considered your \"home world\".\nUseful if you're datacenter travelling and want to see prices there.".Loc());
