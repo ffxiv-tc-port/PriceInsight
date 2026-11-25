@@ -1,8 +1,8 @@
 name: Price Insight
 author: Kouzukii
-punchline: 滑鼠懸停即可查看道具的市場公告板價格！
+punchline: 滑鼠懸停即可查看道具的市場佈告板價格！
 description: |
-  當你將滑鼠移到道具上時，會在下方顯示該道具的普通品/高品質市場公告板價格，以及最近一次的成交紀錄。
+  當你將滑鼠移到道具上時，會在下方顯示該道具的普通品/高品質市場佈告板價格，以及最近一次的成交紀錄。
   價格資料來自 Universalis.app，並會快取 90 分鐘。
   若要重新整理價格，可在滑鼠懸停於道具上時按住 Alt 鍵。
 repo_url: "https://github.com/ffxiv-tc-port/PriceInsight"
