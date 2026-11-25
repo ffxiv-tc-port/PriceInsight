@@ -6,6 +6,7 @@ using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Command;
 using Dalamud.Game.Network.Structures;
 using Dalamud.Plugin;
+using Dalamud.Plugin.Services;
 using Dalamud.Plugin.Ipc;
 using Dalamud.Plugin.Ipc.Exceptions;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -65,6 +66,8 @@ public class PriceInsightPlugin : IDalamudPlugin {
         pluginInterface.UiBuilder.OpenConfigUi += OpenConfigUI;
         Service.ClientState.Logout += ResetSession;
         Service.ClientState.Login += ClientOnLogin;
+        Service.ClientState.TerritoryChanged += ClientOnTerritoryChanged;
+        Service.Framework.Update += OnFrameworkUpdate;
         Service.MarketBoard.OfferingsReceived += MarketBoardOnOfferingsReceived;
         Service.MarketBoard.HistoryReceived += MarketBoardOnHistoryReceived;
         Service.MarketBoard.TaxRatesReceived += MarketBoardOnTaxRatesReceived;
@@ -99,6 +102,28 @@ public class PriceInsightPlugin : IDalamudPlugin {
 
     private void ClientOnLogin() {
         CheckInventories(FetchSource.Login, InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4);
+    }
+
+    // 換區事件來自封包處理（不在框架更新內、角色資料可能還沒更新）：只立旗標，下一個框架更新才讀目前世界。
+    // 漏接也無妨：每次查價前 CheckReady 還會再比對一次。
+    private volatile bool worldCheckPending;
+
+    private void ClientOnTerritoryChanged(ushort territoryId) => worldCheckPending = true;
+
+    private void OnFrameworkUpdate(IFramework framework) {
+        if (!worldCheckPending)
+            return;
+        try {
+            if (!Configuration.UseCurrentWorld)
+                worldCheckPending = false;
+            else if (Service.ObjectTable.LocalPlayer != null) {
+                worldCheckPending = false;
+                ItemPriceLookup.CheckReady();
+            }
+        } catch (Exception e) {
+            worldCheckPending = false;
+            Service.PluginLog.Error(e, "Failed to follow the current world");
+        }
     }
 
     private DateTime lastCheckInventory = DateTime.MinValue;
@@ -196,6 +221,8 @@ public class PriceInsightPlugin : IDalamudPlugin {
         Service.CommandManager.RemoveHandler("/priceinsight");
         Service.ClientState.Logout -= ResetSession;
         Service.ClientState.Login -= ClientOnLogin;
+        Service.ClientState.TerritoryChanged -= ClientOnTerritoryChanged;
+        Service.Framework.Update -= OnFrameworkUpdate;
         Service.MarketBoard.OfferingsReceived -= MarketBoardOnOfferingsReceived;
         Service.MarketBoard.HistoryReceived -= MarketBoardOnHistoryReceived;
         Service.MarketBoard.TaxRatesReceived -= MarketBoardOnTaxRatesReceived;

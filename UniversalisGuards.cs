@@ -125,6 +125,37 @@ internal sealed class WorldStoreSet<T> where T : class {
     }
 }
 
+/// <summary>
+/// 目前查價用哪個世界的狀態。<c>follow</c>＝「使用目前世界」；關著時第一次選定後就固定，行為與舊版相同。
+/// 換世界只換 <see cref="Store"/> 指向的狀態：呼叫端已經抓在手上的舊狀態不受影響，所以進行中的查詢結果仍存回舊世界。
+/// </summary>
+internal sealed class WorldFollower<T> where T : class {
+    internal readonly record struct Change(uint? From, uint To, uint? Evicted);
+
+    private sealed record Tracked(uint WorldId, T Store);
+
+    private readonly WorldStoreSet<T> stores;
+    private volatile Tracked? tracked;
+
+    public WorldFollower(WorldStoreSet<T> stores) => this.stores = stores;
+
+    public T? Store => tracked?.Store;
+
+    public uint? WorldId => tracked?.WorldId;
+
+    /// <summary>只在單一執行緒（框架執行緒）呼叫。世界 id 0＝讀不到，一律不動。</summary>
+    /// <returns>這次真的換了世界（含第一次選定）才回傳；否則 null。</returns>
+    public Change? Update(bool follow, uint currentWorldId, uint homeWorldId) {
+        var now = tracked;
+        var target = now == null ? (follow ? currentWorldId : homeWorldId) : (follow ? currentWorldId : now.WorldId);
+        if (target == 0 || target == now?.WorldId)
+            return null;
+        var store = stores.GetOrCreate(target, out var evicted);
+        tracked = new Tracked(target, store);
+        return new Change(now?.WorldId, target, evicted);
+    }
+}
+
 /// <summary>對 Universalis 的請求量計數，每小時吐一行彙總（整小時沒有任何動靜就不吐）。</summary>
 internal sealed class UniversalisStats {
     public static readonly TimeSpan Interval = TimeSpan.FromHours(1);

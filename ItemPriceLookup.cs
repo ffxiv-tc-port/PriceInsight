@@ -28,7 +28,8 @@ public class ItemPriceLookup : IDisposable {
     }
 
     private readonly ConcurrentQueue<uint> requestedItems = new();
-    private readonly ConcurrentDictionary<uint, (Task Task, CancellationTokenSource Token)> activeTasks = new();
+    // Keyed by world too: a lookup still running for the world just left must not mask the same item on the new one.
+    private readonly ConcurrentDictionary<(uint WorldId, uint ItemId), (Task Task, CancellationTokenSource Token)> activeTasks = new();
     // Items whose cached entry is still shown while a forced (alt) refresh is in flight.
     private readonly ConcurrentDictionary<uint, byte> refreshingItems = new();
     // An entry younger than this is not worth re-fetching on a forced refresh.
@@ -40,9 +41,10 @@ public class ItemPriceLookup : IDisposable {
     private static readonly TimeSpan EmptyCacheDuration = TimeSpan.FromMinutes(10);
     private readonly PriceInsightPlugin plugin;
     private readonly CancellationTokenSource cancellationTokenSource = new();
-    // Picked once per session by the first CheckReady and never swapped: moving to another world
-    // mid-session keeps querying the world picked at login.
-    private volatile WorldPriceStore? store;
+    // With UseCurrentWorld it follows the character's current world (swapped by CheckReady on the framework
+    // thread); otherwise it is the home world picked once per session.
+    private readonly WorldFollower<WorldPriceStore> world;
+    private WorldPriceStore? store => world.Store;
     // Framework thread only; counts one cache hit / cooldown skip per hovered item, not per tooltip update.
     private ulong lastCountedHoverItem;
 
@@ -57,22 +59,33 @@ public class ItemPriceLookup : IDisposable {
 
     public ItemPriceLookup(PriceInsightPlugin plugin) {
         this.plugin = plugin;
+        world = new WorldFollower<WorldPriceStore>(plugin.WorldStores);
         Task.Run(ProcessQueue, cancellationTokenSource.Token)
             // Silently ignore cancel
             .ContinueWith(_ => { }, TaskContinuationOptions.OnlyOnCanceled);
     }
 
+    /// <summary>Framework thread only (reads the local player and may swap the tracked world).</summary>
     public bool CheckReady() {
-        if (store != null)
+        var follow = plugin.Configuration.UseCurrentWorld;
+        if (store != null && !follow)
             return true;
         var localPlayer = Service.ObjectTable.LocalPlayer;
-        if (localPlayer == null) return false;
-        var worldId = plugin.Configuration.UseCurrentWorld ? localPlayer.CurrentWorld.RowId : localPlayer.HomeWorld.RowId;
-        store = plugin.WorldStores.GetOrCreate(worldId, out var evicted);
-        if (evicted != null)
-            Service.PluginLog.Debug($"Price cache: dropped world {evicted}, keeping at most {PriceInsightPlugin.KeptWorlds} worlds");
-        return true;
+        if (localPlayer == null) return store != null;
+        if (world.Update(follow, localPlayer.CurrentWorld.RowId, localPlayer.HomeWorld.RowId) is { } change) {
+            if (change.From is { } from) {
+                // Refresh markers belong to lookups of the world just left; they would never be cleared.
+                refreshingItems.Clear();
+                Service.PluginLog.Information($"[PriceInsight] 目前世界由 {WorldName(from)} 換成 {WorldName(change.To)}，之後查 {WorldName(change.To)} 的價格；還在跑的舊世界查詢結果仍存回 {WorldName(from)} 的快取");
+            }
+            if (change.Evicted != null)
+                Service.PluginLog.Debug($"Price cache: dropped world {change.Evicted}, keeping at most {PriceInsightPlugin.KeptWorlds} worlds");
+        }
+        return store != null;
     }
+
+    private static string WorldName(uint worldId) =>
+        UniversalisClientV2.WorldLookup.TryGetValue(worldId, out var w) ? $"{w.Name}({worldId})" : worldId.ToString();
 
     public (MarketBoardData? MarketBoardData, LookupState State) Get(ulong fullItemId, bool refresh) {
         if (!ToMarketableItemId(fullItemId, out var itemId))
@@ -94,7 +107,7 @@ public class ItemPriceLookup : IDisposable {
             // Keep showing the old entry while the refresh lookup runs; it gets swapped out once
             // the fetch completes. Don't cancel an in-flight fetch - its result is fresh enough.
             refreshingItems[itemId] = 0;
-            if (!activeTasks.ContainsKey(itemId) && !requestedItems.Contains(itemId))
+            if (!activeTasks.ContainsKey((s.WorldId, itemId)) && !requestedItems.Contains(itemId))
                 Enqueue(itemId, FetchSource.Hover);
             return (cached, LookupState.Refreshing);
         }
@@ -106,7 +119,7 @@ public class ItemPriceLookup : IDisposable {
                 plugin.Stats.HoverCacheHit();
             return (cached, refreshingItems.ContainsKey(itemId) ? LookupState.Refreshing : LookupState.Marketable);
         }
-        if (activeTasks.TryGetValue(itemId, out var t))
+        if (activeTasks.TryGetValue((s.WorldId, itemId), out var t))
             return (null, t.Task.IsFaulted ? LookupState.Faulted : LookupState.Marketable);
         // Alt skips the per-item cooldown (the user asked explicitly) but not the circuit breaker.
         if (suspended)
@@ -158,7 +171,7 @@ public class ItemPriceLookup : IDisposable {
                 plugin.Stats.PrefetchCacheHit();
                 continue;
             }
-            if (activeTasks.TryGetValue(itemId, out var t) && !t.Task.IsFaulted)
+            if (activeTasks.TryGetValue((s.WorldId, itemId), out var t) && !t.Task.IsFaulted)
                 continue;
             if (s.Failures.IsCoolingDown(itemId, now)) {
                 plugin.Stats.CooldownSkip();
@@ -331,6 +344,7 @@ public class ItemPriceLookup : IDisposable {
         var token = CancellationTokenSource.CreateLinkedTokenSource(cancellationTokenSource.Token);
         // Captured once so a batch can only ever write into the world it was asked for.
         var s = store;
+        var worldId = s?.WorldId ?? 0;
         var itemTask = FetchItemTask();
 
         foreach (var id in itemIds) {
@@ -351,11 +365,11 @@ public class ItemPriceLookup : IDisposable {
                     }
                 }
 
-                activeTasks.TryRemove(id, out _);
+                activeTasks.TryRemove((worldId, id), out _);
                 refreshingItems.TryRemove(id, out _);
             }, token.Token);
             task.ContinueWith(_ => { }, TaskContinuationOptions.OnlyOnCanceled);
-            activeTasks[id] = (task, token);
+            activeTasks[(worldId, id)] = (task, token);
         }
 
         return itemTask;
